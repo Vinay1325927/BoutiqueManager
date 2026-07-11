@@ -1,7 +1,7 @@
 import streamlit as st
 from pymongo import MongoClient
 import pandas as pd
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
@@ -10,9 +10,23 @@ import time
 import hmac
 import hashlib
 import re
+import secrets as py_secrets
+from urllib.parse import parse_qs, urlencode, urlparse
 from html import escape as html_escape
 import bcrypt
 from dotenv import load_dotenv
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
 
 load_dotenv("credentials/.env")
 
@@ -2057,6 +2071,10 @@ def page_add_sale(public=False):
 _MAX_ATTEMPTS   = 5
 _LOCKOUT_SECS   = 300   # 5-minute lockout after max attempts
 _BACKOFF_BASE   = 1.5   # seconds — doubles each attempt after 1st failure
+_QR_TOKEN_PREFIX = "SKB-QR1"
+_QR_TOKEN_BYTES = 48
+_QR_DEFAULT_MINUTES = 15
+_QR_MAX_DAYS = 7
 
 def _get_stored_hash() -> bytes | None:
     """
@@ -2140,6 +2158,274 @@ def _verify_credentials(username: str, password: str) -> bool:
     return user_ok and pass_ok
 
 
+def _qr_login_collection():
+    return get_db()["qr_login_tokens"]
+
+
+def _qr_login_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _as_utc_naive(value) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _format_qr_dt(value) -> str:
+    dt = _as_utc_naive(value)
+    return dt.strftime("%d %b %Y, %I:%M %p") if dt else "-"
+
+
+def _clean_qr_subject(value: str) -> str:
+    subject = re.sub(r"\s+", " ", str(value or "")).strip()
+    return subject[:80]
+
+
+def _new_qr_login_token() -> str:
+    return f"{_QR_TOKEN_PREFIX}.{py_secrets.token_urlsafe(_QR_TOKEN_BYTES)}"
+
+
+def _qr_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
+def _extract_qr_login_token(payload: str) -> str:
+    text = str(payload or "").strip()
+    if not text:
+        return ""
+
+    parsed = urlparse(text)
+    if parsed.query:
+        params = parse_qs(parsed.query)
+        for key in ("qr_login", "token", "code"):
+            values = params.get(key)
+            if values:
+                text = str(values[0] or "").strip()
+                break
+
+    return text if text.startswith(f"{_QR_TOKEN_PREFIX}.") else ""
+
+
+def _build_qr_payload(token: str, app_url: str = "") -> str:
+    app_url = str(app_url or "").strip()
+    if not app_url:
+        return token
+    joiner = "&" if "?" in app_url else "?"
+    return f"{app_url}{joiner}{urlencode({'qr_login': token})}"
+
+
+def _qr_png_bytes(payload: str) -> BytesIO:
+    if qrcode is None:
+        raise RuntimeError("Install qrcode[pil] to generate QR login images.")
+
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_Q,
+        box_size=9,
+        border=3,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="#0F172A", back_color="white").convert("RGB")
+    out = BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return out
+
+
+def _decode_qr_image(file_obj) -> tuple[str, str | None]:
+    if cv2 is None or np is None:
+        return "", "QR scanning requires opencv-python-headless and numpy in requirements.txt."
+
+    try:
+        raw = file_obj.getvalue()
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        image = None
+
+    if image is None:
+        return "", "Could not read that image. Try a clearer QR photo."
+
+    detector = cv2.QRCodeDetector()
+    data, _, _ = detector.detectAndDecode(image)
+    if not data and hasattr(detector, "detectAndDecodeMulti"):
+        try:
+            ok, decoded_info, _, _ = detector.detectAndDecodeMulti(image)
+            if ok:
+                data = next((item for item in decoded_info if item), "")
+        except Exception:
+            data = ""
+
+    data = str(data or "").strip()
+    if not data:
+        return "", "No QR code was detected. Try better lighting or upload the QR image."
+    return data, None
+
+
+def _qr_login_status(doc: dict, now: datetime | None = None) -> str:
+    now = now or _qr_login_now()
+    expires_at = _as_utc_naive(doc.get("expires_at"))
+    uses = int(doc.get("uses", 0) or 0)
+    max_uses = max(int(doc.get("max_uses", 1) or 1), 1)
+
+    if doc.get("revoked_at"):
+        return "Revoked"
+    if expires_at and expires_at <= now:
+        return "Expired"
+    if uses >= max_uses:
+        return "Used"
+    return "Active"
+
+
+def create_qr_login(for_user: str, valid_minutes: int, max_uses: int, note: str = "", app_url: str = "") -> tuple[str, dict]:
+    for_user = _clean_qr_subject(for_user)
+    if not for_user:
+        raise ValueError("Enter who this QR login is for.")
+
+    valid_minutes = max(1, min(int(valid_minutes or _QR_DEFAULT_MINUTES), _QR_MAX_DAYS * 24 * 60))
+    max_uses = max(1, min(int(max_uses or 1), 20))
+    now = _qr_login_now()
+    token = _new_qr_login_token()
+    doc = {
+        "token_hash": _qr_token_hash(token),
+        "for_user": for_user,
+        "created_by": st.session_state.get("username", "Admin"),
+        "created_at": now,
+        "expires_at": now + timedelta(minutes=valid_minutes),
+        "uses": 0,
+        "max_uses": max_uses,
+        "note": str(note or "").strip()[:200],
+        "app_url": str(app_url or "").strip()[:300],
+    }
+    result = _qr_login_collection().insert_one(doc.copy())
+    doc["_id"] = result.inserted_id
+    return token, doc
+
+
+def consume_qr_login(payload: str) -> tuple[bool, str, dict | None]:
+    token = _extract_qr_login_token(payload)
+    if not token:
+        return False, "This QR code is not a valid boutique login code.", None
+
+    token_hash = _qr_token_hash(token)
+    doc = _qr_login_collection().find_one({"token_hash": token_hash})
+    if not doc:
+        return False, "QR login was not found. It may have been revoked or generated for another app.", None
+
+    status = _qr_login_status(doc)
+    if status == "Revoked":
+        return False, "This QR login has been revoked.", None
+    if status == "Expired":
+        return False, "This QR login has expired. Generate a fresh QR code.", None
+    if status == "Used":
+        return False, "This QR login has already reached its allowed scan limit.", None
+
+    uses = int(doc.get("uses", 0) or 0)
+    now = _qr_login_now()
+    result = _qr_login_collection().update_one(
+        {
+            "_id": doc["_id"],
+            "token_hash": token_hash,
+            "uses": uses,
+            "expires_at": {"$gt": now},
+            "$or": [{"revoked_at": {"$exists": False}}, {"revoked_at": None}],
+        },
+        {
+            "$inc": {"uses": 1},
+            "$set": {
+                "last_used_at": now,
+                "last_used_by": _clean_qr_subject(doc.get("for_user")) or "QR User",
+            },
+        },
+    )
+    if result.modified_count != 1:
+        return False, "This QR login is no longer valid. Generate a fresh QR code.", None
+
+    doc["uses"] = uses + 1
+    doc["last_used_at"] = now
+    return True, "QR login accepted.", doc
+
+
+def _complete_qr_login(doc: dict):
+    username = _clean_qr_subject(doc.get("for_user")) or "QR User"
+    st.session_state.logged_in = True
+    st.session_state.username = username
+    st.session_state.auth_method = "qr"
+    st.session_state.login_attempts = 0
+    st.session_state.login_lock_until = 0
+
+
+def _process_qr_login_payload(payload: str) -> bool:
+    ok, message, doc = consume_qr_login(payload)
+    if ok and doc:
+        _complete_qr_login(doc)
+        st.session_state.qr_login_success = f"Signed in with QR code as {doc.get('for_user', 'QR User')}."
+        st.rerun()
+        return True
+    st.error(message)
+    return False
+
+
+def _get_qr_query_payload() -> str:
+    try:
+        value = st.query_params.get("qr_login", "")
+    except Exception:
+        try:
+            value = st.experimental_get_query_params().get("qr_login", "")
+        except Exception:
+            value = ""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def _clear_qr_query_payload():
+    try:
+        if "qr_login" in st.query_params:
+            del st.query_params["qr_login"]
+        return
+    except Exception:
+        pass
+    try:
+        st.experimental_set_query_params()
+    except Exception:
+        pass
+
+
+def handle_qr_query_login():
+    payload = _get_qr_query_payload()
+    if not payload:
+        return
+    ok, message, doc = consume_qr_login(payload)
+    _clear_qr_query_payload()
+    if ok and doc:
+        _complete_qr_login(doc)
+        st.session_state.qr_login_success = f"Signed in with QR code as {doc.get('for_user', 'QR User')}."
+        st.rerun()
+    else:
+        st.session_state.qr_login_error = message
+
+
+def get_qr_login_docs(limit: int = 50) -> list[dict]:
+    try:
+        return list(_qr_login_collection().find({}, {"token_hash": 0}).sort("created_at", -1).limit(limit))
+    except Exception:
+        return []
+
+
 # =====================================================
 # ADMIN LOGIN
 # =====================================================
@@ -2148,47 +2434,81 @@ def render_admin_login_strip():
     st.markdown("<div class='admin-strip'>", unsafe_allow_html=True)
     st.markdown("<div class='admin-strip-label'>◆ Admin Access</div>", unsafe_allow_html=True)
 
-    # Credential config check (fail closed if nothing set)
-    if _get_stored_hash() is None or _get_username() is None:
-        with st.expander("Sign in to Admin Dashboard", expanded=False):
-            st.error(
-                "Admin credentials are not configured. "
-                "Set USERNAME and PASSWORD (or PASSWORD_HASH) in st.secrets or environment variables."
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-        return
-
     with st.expander("Sign in to Admin Dashboard", expanded=False):
-        locked, secs_left = _check_lockout()
-        if locked:
-            st.error(f"Too many failed attempts. Try again in {secs_left // 60}m {secs_left % 60}s.")
-            st.markdown("</div>", unsafe_allow_html=True)
-            return
+        qr_error = st.session_state.pop("qr_login_error", None)
+        qr_success = st.session_state.pop("qr_login_success", None)
+        if qr_error:
+            st.error(qr_error)
+        if qr_success:
+            st.success(qr_success)
 
-        attempts_left = _MAX_ATTEMPTS - st.session_state.get("login_attempts", 0)
-        if attempts_left < _MAX_ATTEMPTS:
-            st.warning(f"{attempts_left} attempt(s) remaining before lockout.")
+        password_tab, qr_tab = st.tabs(["Password", "Scan QR Code"])
 
-        with st.form("admin_login_form"):
-            u = st.text_input("Username", placeholder="username",   key="admin_u")
-            p = st.text_input("Password", type="password",
-                              placeholder="••••••••",                key="admin_p")
-            submitted = st.form_submit_button("Sign In", use_container_width=True)
-
-        if submitted:
-            if _verify_credentials(u, p):
-                st.session_state.logged_in      = True
-                st.session_state.username        = u
-                st.session_state.login_attempts  = 0
-                st.session_state.login_lock_until = 0
-                st.rerun()
+        with password_tab:
+            # Credential config check for password login only. QR logins stay available.
+            if _get_stored_hash() is None or _get_username() is None:
+                st.error(
+                    "Admin credentials are not configured. "
+                    "Set USERNAME and PASSWORD (or PASSWORD_HASH) in st.secrets or environment variables."
+                )
             else:
-                _record_failure()
-                locked2, secs_left2 = _check_lockout()
-                if locked2:
-                    st.error(f"Account locked for {secs_left2 // 60}m {secs_left2 % 60}s.")
+                locked, secs_left = _check_lockout()
+                if locked:
+                    st.error(f"Too many failed attempts. Try again in {secs_left // 60}m {secs_left % 60}s.")
                 else:
-                    st.error("Invalid credentials.")
+                    attempts_left = _MAX_ATTEMPTS - st.session_state.get("login_attempts", 0)
+                    if attempts_left < _MAX_ATTEMPTS:
+                        st.warning(f"{attempts_left} attempt(s) remaining before lockout.")
+
+                    with st.form("admin_login_form"):
+                        u = st.text_input("Username", placeholder="username",   key="admin_u")
+                        p = st.text_input("Password", type="password",
+                                          placeholder="••••••••",                key="admin_p")
+                        submitted = st.form_submit_button("Sign In", use_container_width=True)
+
+                    if submitted:
+                        if _verify_credentials(u, p):
+                            st.session_state.logged_in      = True
+                            st.session_state.username        = u
+                            st.session_state.auth_method     = "password"
+                            st.session_state.login_attempts  = 0
+                            st.session_state.login_lock_until = 0
+                            st.rerun()
+                        else:
+                            _record_failure()
+                            locked2, secs_left2 = _check_lockout()
+                            if locked2:
+                                st.error(f"Account locked for {secs_left2 // 60}m {secs_left2 % 60}s.")
+                            else:
+                                st.error("Invalid credentials.")
+
+        with qr_tab:
+            st.caption("Scan a secure QR code generated from Manage Logins & QR Code.")
+            camera_qr = st.camera_input("Scan QR Code", key="login_qr_camera")
+            uploaded_qr = st.file_uploader(
+                "Or upload a QR image",
+                type=["png", "jpg", "jpeg"],
+                key="login_qr_upload",
+            )
+            scanned_qr = camera_qr or uploaded_qr
+            if scanned_qr:
+                payload, decode_error = _decode_qr_image(scanned_qr)
+                if decode_error:
+                    st.warning(decode_error)
+                else:
+                    _process_qr_login_payload(payload)
+
+            manual_qr = st.text_input(
+                "Paste QR token",
+                type="password",
+                placeholder="Use this only if scanning is not available",
+                key="login_qr_manual_token",
+            )
+            if st.button("Sign In With QR Code", key="login_qr_manual_submit", use_container_width=True):
+                if manual_qr.strip():
+                    _process_qr_login_payload(manual_qr.strip())
+                else:
+                    st.error("Scan a QR code or paste its token first.")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2237,6 +2557,7 @@ def sidebar():
             "Analytics",
             "Reminders & Alerts",
             "Generate Bill",
+            "Manage Logins & QR Code",
             "Backup & Restore",
             "Logout",
         ], label_visibility="collapsed")
@@ -2251,6 +2572,136 @@ def sidebar():
 # =====================================================
 # ADMIN PAGES
 # =====================================================
+
+def page_manage_logins():
+    page_header("Manage Logins", "Secure QR Code Access")
+    st.info(
+        "QR logins use high-entropy random tokens. Only the token hash is stored in MongoDB, "
+        "and each code can expire, be scan-limited, and be revoked."
+    )
+
+    expiry_options = {
+        "15 minutes": 15,
+        "30 minutes": 30,
+        "1 hour": 60,
+        "4 hours": 240,
+        "1 day": 1440,
+        "7 days": 10080,
+    }
+
+    left, right = st.columns([1.05, 0.95])
+    with left:
+        sec("Generate QR Login")
+        with st.form("qr_login_generate_form"):
+            for_user = st.text_input("For Whom", placeholder="Staff or person name")
+            valid_label = st.selectbox("Valid For", list(expiry_options.keys()), index=0)
+            max_uses = st.number_input("Allowed Scans", min_value=1, max_value=20, value=1, step=1)
+            app_url = st.text_input(
+                "App Login URL",
+                placeholder="Optional: https://your-streamlit-app-url",
+                help="Optional. If added, scanning the QR with a phone opens the app with the secure login token.",
+            )
+            note = st.text_input("Purpose / Device Note", placeholder="Optional")
+            submitted = st.form_submit_button("Generate Secure QR Code", use_container_width=True)
+
+        if submitted:
+            try:
+                token, doc = create_qr_login(
+                    for_user=for_user,
+                    valid_minutes=expiry_options[valid_label],
+                    max_uses=int(max_uses),
+                    note=note,
+                    app_url=app_url,
+                )
+                payload = _build_qr_payload(token, app_url)
+                st.session_state.last_qr_login = {
+                    "token": token,
+                    "payload": payload,
+                    "for_user": doc["for_user"],
+                    "expires_at": doc["expires_at"].isoformat(),
+                    "max_uses": doc["max_uses"],
+                }
+                st.success(f"QR login generated for {doc['for_user']}.")
+            except Exception as exc:
+                st.error(str(exc))
+
+    with right:
+        sec("Latest QR Code")
+        latest = st.session_state.get("last_qr_login")
+        if latest:
+            try:
+                qr_png = _qr_png_bytes(latest["payload"])
+                png_bytes = qr_png.getvalue()
+                st.image(png_bytes, width=280, caption=f"For {latest['for_user']}")
+                safe_subject = re.sub(r"[^0-9A-Za-z]+", "_", latest["for_user"]).strip("_").lower() or "qr_login"
+                st.download_button(
+                    "Download QR PNG",
+                    data=png_bytes,
+                    file_name=f"{safe_subject}_qr_login.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
+                st.caption(
+                    f"Expires: {_format_qr_dt(latest.get('expires_at'))} | "
+                    f"Allowed scans: {latest.get('max_uses', 1)}"
+                )
+                with st.expander("Emergency copy token", expanded=False):
+                    st.code(latest["token"])
+            except Exception as exc:
+                st.error(str(exc))
+        else:
+            st.markdown(
+                "<div class='empty'><div class='empty-glyph'>◆</div><div>No QR code generated in this session.</div></div>",
+                unsafe_allow_html=True,
+            )
+
+    rule()
+    sec("Active QR Logins")
+    docs = get_qr_login_docs(limit=100)
+    active_docs = [doc for doc in docs if _qr_login_status(doc) == "Active"]
+    if active_docs:
+        labels = {}
+        for doc in active_docs:
+            scans = f"{int(doc.get('uses', 0) or 0)}/{int(doc.get('max_uses', 1) or 1)}"
+            short_id = str(doc.get("_id", ""))[-6:]
+            label = f"{doc.get('for_user', 'QR User')} | expires {_format_qr_dt(doc.get('expires_at'))} | scans {scans} | {short_id}"
+            labels[label] = doc
+        selected_label = st.selectbox("Select QR Login To Revoke", list(labels.keys()))
+        if st.button("Revoke Selected QR Login", use_container_width=True):
+            selected_doc = labels[selected_label]
+            _qr_login_collection().update_one(
+                {"_id": selected_doc["_id"]},
+                {"$set": {
+                    "revoked_at": _qr_login_now(),
+                    "revoked_by": st.session_state.get("username", "Admin"),
+                }},
+            )
+            st.success("QR login revoked.")
+            st.rerun()
+    else:
+        st.caption("No active QR logins right now.")
+
+    sec("Recent QR Login Activity")
+    if not docs:
+        st.markdown("<div class='empty'><div class='empty-glyph'>◆</div><div>No QR login records yet.</div></div>", unsafe_allow_html=True)
+        return
+
+    rows = []
+    for doc in docs:
+        uses = int(doc.get("uses", 0) or 0)
+        max_uses = int(doc.get("max_uses", 1) or 1)
+        rows.append({
+            "For Whom": doc.get("for_user", "QR User"),
+            "Status": _qr_login_status(doc),
+            "Scans": f"{uses}/{max_uses}",
+            "Expires": _format_qr_dt(doc.get("expires_at")),
+            "Created By": doc.get("created_by", "Admin"),
+            "Created": _format_qr_dt(doc.get("created_at")),
+            "Last Used": _format_qr_dt(doc.get("last_used_at")),
+            "Note": doc.get("note", ""),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 def page_dashboard():
     page_header("Dashboard", "Business Overview")
@@ -3401,6 +3852,9 @@ def main():
     inject_theme()
 
     if not st.session_state.logged_in:
+        handle_qr_query_login()
+
+    if not st.session_state.logged_in:
         page_add_sale(public=True)
         render_admin_login_strip()
         return
@@ -3415,10 +3869,12 @@ def main():
     elif "Analytics"   in page: page_analytics()
     elif "Reminders"   in page: page_reminders()
     elif "Generate Bill" in page: page_generate_bill()
+    elif "Manage Logins" in page: page_manage_logins()
     elif "Backup"      in page: page_backup_restore()
     elif "Logout"      in page:
         st.session_state.logged_in = False
         st.session_state.username  = None
+        st.session_state.auth_method = None
         st.rerun()
 
 if __name__ == "__main__":
