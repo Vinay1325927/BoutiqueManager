@@ -1,7 +1,7 @@
 import streamlit as st
 from pymongo import MongoClient
 import pandas as pd
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
@@ -9,24 +9,12 @@ import os
 import time
 import hmac
 import hashlib
+import secrets
+import uuid
 import re
-import secrets as py_secrets
-from urllib.parse import parse_qs, urlencode, urlparse
+import json
 from html import escape as html_escape
-import bcrypt
 from dotenv import load_dotenv
-
-try:
-    import qrcode
-except ImportError:
-    qrcode = None
-
-try:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
-except ImportError:
-    serialization = None
-    rsa = None
 
 load_dotenv("credentials/.env")
 
@@ -997,13 +985,638 @@ VENDOR_MANUAL_OPTION = "Add new vendor..."
 # MONGODB
 # =====================================================
 
+def safe_secret(key: str, default: str = ""):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+def get_gemini_key() -> str:
+    return (
+        safe_secret("GEMINI_API_KEY", "")
+        or safe_secret("GOOGLE_API_KEY", "")
+        or safe_secret("GOOGLE_AI_API_KEY", "")
+        or safe_secret("GOOGLE_GENERATIVE_AI_API_KEY", "")
+        or safe_secret("GENAI_API_KEY", "")
+        or safe_secret("GEMINI_KEY", "")
+        or safe_secret("gemini_api_key", "")
+        or os.getenv("GEMINI_API_KEY", "")
+        or os.getenv("GOOGLE_API_KEY", "")
+        or os.getenv("GOOGLE_AI_API_KEY", "")
+        or os.getenv("GOOGLE_GENERATIVE_AI_API_KEY", "")
+        or os.getenv("GENAI_API_KEY", "")
+        or os.getenv("GEMINI_KEY", "")
+    )
+
+def get_gemini_model() -> str:
+    return safe_secret("GEMINI_MODEL", "") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+def get_openai_key() -> str:
+    return safe_secret("OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+
+def get_openai_model() -> str:
+    return safe_secret("OPENAI_MODEL", "") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+def get_ai_provider() -> str:
+    configured = (safe_secret("AI_PROVIDER", "") or os.getenv("AI_PROVIDER", "")).strip().lower()
+    if configured:
+        return configured
+    if get_gemini_key():
+        return "gemini"
+    if get_openai_key():
+        return "openai"
+    return "gemini"
+
+def llm_is_configured() -> bool:
+    provider = get_ai_provider()
+    if provider in {"gemini", "google"}:
+        return bool(get_gemini_key())
+    if provider == "openai":
+        return bool(get_openai_key())
+    return False
+
+def ai_setup_message() -> str:
+    return (
+        "AI is not configured. Set GEMINI_API_KEY in credentials/.env or .streamlit/secrets.toml. "
+        "Optional: set AI_PROVIDER=gemini and GEMINI_MODEL=gemini-2.5-flash."
+    )
+
+def trim_for_ai(text: str, limit: int = 12000) -> str:
+    text = str(text or "")
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n\n[Context trimmed]"
+
+def df_for_ai(df: pd.DataFrame, columns: list[str] | None = None, limit: int = 40) -> str:
+    if df is None or df.empty:
+        return "No rows."
+    view = df.copy()
+    if columns:
+        view = view[[col for col in columns if col in view.columns]].copy()
+    for col in view.columns:
+        if pd.api.types.is_datetime64_any_dtype(view[col]):
+            view[col] = view[col].dt.strftime("%Y-%m-%d")
+    return view.head(limit).to_csv(index=False)
+
+def ask_llm(task: str, context: str, temperature: float = 0.2) -> str:
+    prompt = f"""
+You are an assistant for {BRAND_NAME}, a boutique sales and passbook tracking app.
+Use only the provided app context. If the context is insufficient, say what is missing.
+Keep the answer practical, concise, and in rupees where amounts are present.
+
+Task:
+{task}
+
+Context:
+{trim_for_ai(context)}
+""".strip()
+
+    provider = get_ai_provider()
+    if provider in {"gemini", "google"}:
+        api_key = get_gemini_key()
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY is not configured.")
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:
+            raise RuntimeError("Install the google-genai package to use Gemini AI features.") from exc
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=get_gemini_model(),
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=temperature),
+        )
+        return getattr(response, "text", "") or str(response)
+
+    if provider == "openai":
+        api_key = get_openai_key()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError("Install the openai package to use OpenAI features.") from exc
+
+        client = OpenAI(api_key=api_key)
+        response = client.responses.create(
+            model=get_openai_model(),
+            input=prompt,
+            temperature=temperature,
+        )
+        return getattr(response, "output_text", "") or str(response)
+
+    raise RuntimeError(f"Unsupported AI_PROVIDER: {provider}. Use gemini or openai.")
+
+def render_ai_panel(title: str, context: str, key: str, default_task: str, expanded: bool = False):
+    with st.expander(title, expanded=expanded):
+        if not llm_is_configured():
+            st.info(ai_setup_message())
+            return
+        task = st.text_area("Ask AI", value=default_task, height=90, key=f"{key}_task")
+        if st.button("Run AI", key=f"{key}_run", width="stretch"):
+            try:
+                with st.spinner("Thinking..."):
+                    st.session_state[f"{key}_answer"] = ask_llm(task, context)
+            except Exception as exc:
+                st.error(str(exc))
+        if st.session_state.get(f"{key}_answer"):
+            st.markdown(st.session_state[f"{key}_answer"])
+
+def render_ai_action_panel(title: str, context: str, key: str, actions: dict[str, str], expanded: bool = False):
+    with st.expander(title, expanded=expanded):
+        if not llm_is_configured():
+            st.info(ai_setup_message())
+            return
+        action_names = list(actions.keys()) + ["Custom"]
+        action_name = st.selectbox("AI Action", action_names, key=f"{key}_action")
+        default_task = "" if action_name == "Custom" else actions.get(action_name, "")
+        action_key = re.sub(r"[^0-9A-Za-z]+", "_", action_name).strip("_").lower() or "custom"
+        task = st.text_area("Instruction", value=default_task, height=100, key=f"{key}_task_{action_key}")
+        if st.button("Run AI", key=f"{key}_run", width="stretch"):
+            if not task.strip():
+                st.warning("Enter what you want AI to do.")
+                return
+            try:
+                with st.spinner("Thinking..."):
+                    st.session_state[f"{key}_answer"] = ask_llm(task, context)
+            except Exception as exc:
+                st.error(str(exc))
+        if st.session_state.get(f"{key}_answer"):
+            st.markdown(st.session_state[f"{key}_answer"])
+
+def parse_json_from_ai(text: str) -> dict:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("AI did not return valid JSON.")
+        parsed = json.loads(raw[start:end + 1])
+    if not isinstance(parsed, dict):
+        raise ValueError("AI response must be a JSON object.")
+    return parsed
+
+def match_option(value, options: list[str]) -> str | None:
+    text = str(value or "").strip()
+    for option in options:
+        if text.casefold() == option.casefold():
+            return option
+    compact = re.sub(r"[^a-z0-9]+", "", text.casefold())
+    for option in options:
+        if compact and compact == re.sub(r"[^a-z0-9]+", "", option.casefold()):
+            return option
+    return None
+
+def bool_from_ai(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "y", "paid", "done", "complete"}
+
+def coerce_ai_sale_updates(row: pd.Series, updates: dict) -> tuple[dict, list[str]]:
+    allowed = {
+        "customer_name", "customer_phone", "sale_date", "product_category", "vendor",
+        "product_description", "quantity", "buying_price", "selling_price", "amount_paid",
+        "payment_method", "delay_status", "notes", "payment_received", "last_payment_date",
+        "last_payment_method", "last_payment_received_by",
+    }
+    set_fields = {}
+    warnings = []
+    for key, value in (updates or {}).items():
+        if value is None or str(value).strip() == "":
+            continue
+        if key not in allowed:
+            warnings.append(f"Ignored unsupported field: {key}")
+            continue
+        if key == "customer_name":
+            set_fields[key] = str(value).strip()[:120]
+        elif key == "customer_phone":
+            set_fields[key] = normalize_phone(str(value))[:20]
+        elif key == "sale_date":
+            parsed_date = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed_date):
+                warnings.append("Ignored invalid sale_date.")
+            else:
+                set_fields[key] = str(parsed_date.date())
+        elif key == "product_category":
+            matched = match_option(value, CATEGORIES)
+            if matched:
+                set_fields[key] = matched
+            else:
+                warnings.append(f"Ignored invalid category: {value}")
+        elif key == "vendor":
+            set_fields[key] = str(value).strip()[:100]
+        elif key == "product_description":
+            set_fields[key] = str(value).strip()[:500]
+        elif key == "quantity":
+            try:
+                qty = int(float(value))
+                if qty < 1:
+                    raise ValueError
+                set_fields[key] = qty
+            except Exception:
+                warnings.append("Ignored invalid quantity.")
+        elif key in {"buying_price", "selling_price", "amount_paid"}:
+            amount = money_value(value, default=-1)
+            if amount < 0:
+                warnings.append(f"Ignored invalid {key}.")
+            else:
+                set_fields[key] = round(float(amount), 2)
+        elif key == "payment_method":
+            matched = match_option(value, PAYMENT_METHODS)
+            if matched:
+                set_fields[key] = matched
+            else:
+                warnings.append(f"Ignored invalid payment_method: {value}")
+        elif key == "delay_status":
+            set_fields[key] = int(bool_from_ai(value))
+        elif key == "notes":
+            set_fields[key] = str(value).strip()[:500]
+        elif key == "payment_received":
+            set_fields[key] = int(bool_from_ai(value))
+        elif key == "last_payment_date":
+            parsed_date = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed_date):
+                warnings.append("Ignored invalid last_payment_date.")
+            else:
+                set_fields[key] = str(parsed_date.date())
+        elif key == "last_payment_method":
+            matched = match_option(value, PAYMENT_COLLECTION_METHODS)
+            if matched:
+                set_fields[key] = matched
+            else:
+                warnings.append(f"Ignored invalid last_payment_method: {value}")
+        elif key == "last_payment_received_by":
+            set_fields[key] = str(value).strip()[:80]
+
+    current_buy = money_value(row.get("buying_price"))
+    current_sell = money_value(row.get("selling_price"))
+    current_paid = money_value(row.get("amount_paid"))
+    buy = money_value(set_fields.get("buying_price", current_buy))
+    sell = money_value(set_fields.get("selling_price", current_sell))
+    paid = money_value(set_fields.get("amount_paid", current_paid))
+
+    if set_fields.get("payment_received") == 1 and "amount_paid" not in set_fields:
+        paid = sell
+        set_fields["amount_paid"] = round(paid, 2)
+    if paid > sell:
+        warnings.append("Amount paid cannot exceed selling price; ignored AI update.")
+        return {}, warnings
+    if sell < buy:
+        warnings.append("AI update creates a loss because selling price is below buying price.")
+
+    if {"buying_price", "selling_price", "amount_paid", "payment_received"} & set(set_fields):
+        pending = max(round(sell - paid, 2), 0.0)
+        set_fields["pending_amount"] = pending
+        set_fields["payment_received"] = 1 if pending == 0 else 0
+
+    if set_fields:
+        set_fields["updated_at"] = str(datetime.now())
+    return set_fields, warnings
+
+def coerce_ai_new_sale_draft(draft: dict) -> tuple[dict, list[str]]:
+    fields = {}
+    warnings = []
+    existing_customers = get_existing_customers_with_phone()
+    customer_by_key = {
+        re.sub(r"[^a-z0-9]+", "", str(customer.get("_id", "")).casefold()): customer
+        for customer in existing_customers
+    }
+
+    name = str(draft.get("customer_name", "") or "").strip()
+    name_key = re.sub(r"[^a-z0-9]+", "", name.casefold())
+    matched_customer = customer_by_key.get(name_key) if name_key else None
+    if matched_customer:
+        name = str(matched_customer.get("_id", "") or name).strip()
+    fields["customer_name"] = name[:120]
+
+    phone = str(draft.get("customer_phone", "") or "").strip()
+    if not phone and matched_customer:
+        phone = str(matched_customer.get("phone", "") or "")
+    fields["customer_phone"] = normalize_phone(phone)[:20]
+
+    parsed_date = pd.to_datetime(draft.get("sale_date") or date.today(), errors="coerce")
+    fields["sale_date"] = str(parsed_date.date() if pd.notna(parsed_date) else date.today())
+
+    category = match_option(draft.get("product_category"), CATEGORIES)
+    if not category:
+        category = "Other"
+        if draft.get("product_category"):
+            warnings.append(f"Category was not recognized, using Other instead of {draft.get('product_category')}.")
+    fields["product_category"] = category
+
+    fields["vendor"] = str(draft.get("vendor", "") or "").strip()[:100]
+    fields["product_description"] = str(draft.get("product_description", "") or "").strip()[:500]
+
+    try:
+        qty = int(float(draft.get("quantity", 1) or 1))
+        fields["quantity"] = max(qty, 1)
+    except Exception:
+        fields["quantity"] = 1
+        warnings.append("Quantity was invalid, using 1.")
+
+    fields["buying_price"] = round(money_value(draft.get("buying_price"), default=0), 2)
+    fields["selling_price"] = round(money_value(draft.get("selling_price"), default=0), 2)
+    fields["amount_paid"] = round(money_value(draft.get("amount_paid"), default=0), 2)
+
+    if bool_from_ai(draft.get("payment_received")) and fields["amount_paid"] <= 0 and fields["selling_price"] > 0:
+        fields["amount_paid"] = fields["selling_price"]
+
+    if fields["amount_paid"] > fields["selling_price"] and fields["selling_price"] > 0:
+        fields["amount_paid"] = fields["selling_price"]
+        warnings.append("Amount paid was above selling price, capped to selling price.")
+
+    payment_method = match_option(draft.get("payment_method"), PAYMENT_METHODS) or "UPI"
+    fields["payment_method"] = payment_method
+    fields["notes"] = str(draft.get("notes", "") or "").strip()[:500]
+
+    fields["pending_amount"] = max(round(fields["selling_price"] - fields["amount_paid"], 2), 0.0)
+    fields["payment_received"] = 1 if fields["pending_amount"] == 0 and fields["selling_price"] > 0 else 0
+    fields["delay_status"] = int(bool_from_ai(draft.get("delay_status")))
+
+    if not fields["customer_name"]:
+        warnings.append("Customer name is missing.")
+    if fields["buying_price"] <= 0:
+        warnings.append("Buying price is missing or zero.")
+    if fields["selling_price"] <= 0:
+        warnings.append("Selling price is missing or zero.")
+    if fields["selling_price"] and fields["buying_price"] and fields["selling_price"] < fields["buying_price"]:
+        warnings.append("Selling price is below buying price.")
+
+    return fields, warnings
+
+def save_sale_record(fields: dict, source: str = "manual") -> int:
+    sale_id = get_next_id()
+    get_col().insert_one({
+        "id":                  sale_id,
+        "customer_name":       str(fields.get("customer_name", "")).strip()[:120],
+        "customer_phone":      normalize_phone(fields.get("customer_phone", "")),
+        "sale_date":           str(fields.get("sale_date") or date.today()),
+        "vendor":              str(fields.get("vendor", "")).strip()[:100],
+        "product_category":    fields.get("product_category") or "Other",
+        "product_description": str(fields.get("product_description", "")).strip()[:500],
+        "quantity":            int(fields.get("quantity") or 1),
+        "buying_price":        round(money_value(fields.get("buying_price")), 2),
+        "selling_price":       round(money_value(fields.get("selling_price")), 2),
+        "amount_paid":         round(money_value(fields.get("amount_paid")), 2),
+        "pending_amount":      round(money_value(fields.get("pending_amount")), 2),
+        "payment_received":    int(fields.get("payment_received") or 0),
+        "delay_status":        int(fields.get("delay_status") or 0),
+        "payment_method":      fields.get("payment_method") if fields.get("payment_method") in PAYMENT_METHODS else "UPI",
+        "notes":               str(fields.get("notes", "")).strip()[:500],
+        "created_via":         source,
+        "created_at":          str(datetime.now()),
+    })
+    invalidate_cache()
+    return sale_id
+
+def render_ai_sale_entry_assistant():
+    if not llm_is_configured():
+        with st.expander("AI Add Sale", expanded=False):
+            st.info(ai_setup_message())
+        return
+
+    sec("AI Add Sale")
+    st.caption("Type the sale in one line. AI will extract a draft, then you can check and save it.")
+    brief = st.text_area(
+        "Sale brief",
+        placeholder="Example: Ramya bought saree from RUPALI. Buying 1495, selling 1895, paid 500 by UPI, balance pending.",
+        height=95,
+        key="ai_sale_brief",
+    )
+    b1, b2 = st.columns([1, 1])
+    with b1:
+        if st.button("Create Sale Draft", key="ai_sale_create_draft", type="primary", width="stretch"):
+            if not brief.strip():
+                st.warning("Type the sale details first.")
+            else:
+                existing_customers = get_existing_customers_with_phone()
+                existing_context = pd.DataFrame([
+                    {"customer_name": c.get("_id", ""), "phone": c.get("phone", ""), "visits": c.get("visits", 0)}
+                    for c in existing_customers[:80]
+                ]).to_csv(index=False)
+                recent_sales = fetch_all()
+                context = "\n".join([
+                    f"Today is {date.today()}.",
+                    "The user is describing one boutique sale. Extract fields from the text. Do not invent unknown prices.",
+                    "If payment method is not mentioned, use UPI. If paid/full paid, amount_paid should equal selling_price.",
+                    "If only pending/balance is mentioned, calculate amount_paid as selling_price minus pending amount.",
+                    "Use an existing customer name exactly if the brief matches one.",
+                    f"Allowed categories: {', '.join(CATEGORIES)}",
+                    f"Allowed payment methods: {', '.join(PAYMENT_METHODS)}",
+                    "Existing customers:\n" + existing_context,
+                    "Recent sales:\n" + df_for_ai(
+                        recent_sales.sort_values("sale_date", ascending=False) if not recent_sales.empty else recent_sales,
+                        ["sale_date","customer_name","vendor","product_category","product_description","buying_price","selling_price","payment_method"],
+                        30,
+                    ),
+                    "Return only JSON in this shape:",
+                    '{"sale": {"customer_name": "", "customer_phone": "", "sale_date": "", "product_category": "", "vendor": "", "product_description": "", "quantity": 1, "buying_price": 0, "selling_price": 0, "amount_paid": 0, "payment_method": "UPI", "notes": ""}, "reason": "short explanation"}',
+                ])
+                try:
+                    with st.spinner("Creating sale draft..."):
+                        raw = ask_llm(brief, context, temperature=0.0)
+                    parsed = parse_json_from_ai(raw)
+                    fields, warnings = coerce_ai_new_sale_draft(parsed.get("sale", {}))
+                    st.session_state.ai_sale_draft = {
+                        "fields": fields,
+                        "warnings": warnings,
+                        "reason": str(parsed.get("reason", "") or ""),
+                    }
+                except Exception as exc:
+                    st.error(str(exc))
+    with b2:
+        if st.button("Clear AI Draft", key="ai_sale_clear_draft", width="stretch"):
+            st.session_state.pop("ai_sale_draft", None)
+            st.rerun()
+
+    draft = st.session_state.get("ai_sale_draft")
+    if not draft:
+        return
+
+    fields = draft.get("fields", {})
+    if draft.get("reason"):
+        st.info(draft["reason"])
+    for warning in draft.get("warnings", []):
+        st.warning(warning)
+
+    with st.form("ai_sale_save_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            customer_name = st.text_input("Customer Name *", value=str(fields.get("customer_name", "")), key="ai_sale_customer_name")
+        with c2:
+            customer_phone = st.text_input("Phone", value=str(fields.get("customer_phone", "")), key="ai_sale_customer_phone")
+        with c3:
+            sale_dt = pd.to_datetime(fields.get("sale_date"), errors="coerce")
+            sale_date_value = sale_dt.date() if pd.notna(sale_dt) else date.today()
+            sale_date = st.date_input("Sale Date", value=sale_date_value, key="ai_sale_date")
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            category_index = CATEGORIES.index(fields.get("product_category")) if fields.get("product_category") in CATEGORIES else CATEGORIES.index("Other")
+            product_category = st.selectbox("Category *", CATEGORIES, index=category_index, key="ai_sale_category")
+        with p2:
+            vendor = st.text_input("Vendor / Supplier", value=str(fields.get("vendor", "")), key="ai_sale_vendor")
+        with p3:
+            quantity = st.number_input("Quantity", min_value=1, step=1, value=int(fields.get("quantity") or 1), key="ai_sale_quantity")
+
+        product_description = st.text_area("Description", value=str(fields.get("product_description", "")), height=65, key="ai_sale_description")
+
+        pr1, pr2, pr3, pr4 = st.columns(4)
+        with pr1:
+            buying_price = st.number_input("Buying Price (₹) *", min_value=0.0, step=1.0, value=float(fields.get("buying_price") or 0), key="ai_sale_buying_price")
+        with pr2:
+            selling_price = st.number_input("Selling Price (₹) *", min_value=0.0, step=1.0, value=float(fields.get("selling_price") or 0), key="ai_sale_selling_price")
+        with pr3:
+            amount_paid = st.number_input("Amount Paid (₹)", min_value=0.0, step=1.0, value=float(fields.get("amount_paid") or 0), key="ai_sale_amount_paid")
+        with pr4:
+            pm_index = PAYMENT_METHODS.index(fields.get("payment_method")) if fields.get("payment_method") in PAYMENT_METHODS else PAYMENT_METHODS.index("UPI")
+            payment_method = st.selectbox("Payment Method", PAYMENT_METHODS, index=pm_index, key="ai_sale_payment_method")
+
+        pending_amount = max(round(float(selling_price) - float(amount_paid), 2), 0.0)
+        profit_amount = round((float(selling_price) - float(buying_price)) * int(quantity), 2)
+        am1, am2, am3 = st.columns(3)
+        am1.metric("Pending", f"₹{pending_amount:,.2f}")
+        am2.metric("Profit", f"₹{profit_amount:,.2f}")
+        am3.metric("Total Value", f"₹{float(selling_price) * int(quantity):,.2f}")
+
+        notes = st.text_area("Notes", value=str(fields.get("notes", "")), height=60, key="ai_sale_notes")
+        save_ai_sale = st.form_submit_button("Save AI Sale", type="primary", width="stretch")
+
+        if save_ai_sale:
+            errs = []
+            if not customer_name.strip():
+                errs.append("Customer name is required.")
+            if buying_price <= 0:
+                errs.append("Buying price must be > 0.")
+            if selling_price <= 0:
+                errs.append("Selling price must be > 0.")
+            if amount_paid > selling_price:
+                errs.append("Amount paid cannot exceed selling price.")
+            if selling_price and buying_price and selling_price < buying_price:
+                st.warning("Selling price is below buying price.")
+            if errs:
+                for err in errs:
+                    st.error(err)
+            else:
+                sale_fields = {
+                    "customer_name": customer_name,
+                    "customer_phone": customer_phone,
+                    "sale_date": str(sale_date),
+                    "vendor": vendor,
+                    "product_category": product_category,
+                    "product_description": product_description,
+                    "quantity": int(quantity),
+                    "buying_price": float(buying_price),
+                    "selling_price": float(selling_price),
+                    "amount_paid": float(amount_paid),
+                    "pending_amount": pending_amount,
+                    "payment_received": 1 if pending_amount == 0 else 0,
+                    "delay_status": 0,
+                    "payment_method": payment_method,
+                    "notes": notes,
+                }
+                sale_id = save_sale_record(sale_fields, source="ai_add_sale")
+                st.session_state.pop("ai_sale_draft", None)
+                st.success(f"AI sale saved as Sale #{sale_id}.")
+                st.rerun()
+
+def render_ai_update_assistant(row: pd.Series, sale_id: int):
+    with st.expander("AI Update Assistant", expanded=False):
+        if not llm_is_configured():
+            st.info(ai_setup_message())
+            return
+        st.caption("Type updates in plain English. You will see a preview before anything is saved.")
+        instruction = st.text_area(
+            "What should I update?",
+            placeholder="Example: change selling price to 4200, amount paid to 2000, payment method UPI, and notes customer will pay balance next week",
+            height=100,
+            key=f"ai_update_instruction_{sale_id}",
+        )
+        preview_key = f"ai_update_preview_{sale_id}"
+        if st.button("Preview AI Update", key=f"ai_update_preview_btn_{sale_id}", width="stretch"):
+            if not instruction.strip():
+                st.warning("Type what needs to be updated.")
+            else:
+                current_record = row.to_dict()
+                context = "\n".join([
+                    f"Sale ID: {sale_id}",
+                    "Current sale record JSON:",
+                    json.dumps(current_record, default=str, ensure_ascii=False),
+                    "Allowed fields:",
+                    ", ".join([
+                        "customer_name", "customer_phone", "sale_date", "product_category", "vendor",
+                        "product_description", "quantity", "buying_price", "selling_price",
+                        "amount_paid", "payment_method", "delay_status", "notes", "payment_received",
+                        "last_payment_date", "last_payment_method", "last_payment_received_by",
+                    ]),
+                    f"Allowed categories: {', '.join(CATEGORIES)}",
+                    f"Allowed sale payment methods: {', '.join(PAYMENT_METHODS)}",
+                    f"Allowed received payment methods: {', '.join(PAYMENT_COLLECTION_METHODS)}",
+                    "If the user says mark paid, set payment_received true and amount_paid equal to selling_price.",
+                    "If the user gives a partial payment amount, set amount_paid to that amount.",
+                    "Return only JSON in this shape: {\"updates\": {\"field\": \"value\"}, \"reason\": \"short explanation\"}.",
+                ])
+                try:
+                    with st.spinner("Reading your update..."):
+                        raw = ask_llm(instruction, context, temperature=0.0)
+                    parsed = parse_json_from_ai(raw)
+                    set_fields, warnings = coerce_ai_sale_updates(row, parsed.get("updates", {}))
+                    st.session_state[preview_key] = {
+                        "updates": set_fields,
+                        "warnings": warnings,
+                        "reason": str(parsed.get("reason", "") or ""),
+                        "raw": raw,
+                    }
+                except Exception as exc:
+                    st.error(str(exc))
+
+        preview = st.session_state.get(preview_key)
+        if preview:
+            updates = preview.get("updates", {})
+            warnings = preview.get("warnings", [])
+            if preview.get("reason"):
+                st.info(preview["reason"])
+            for warning in warnings:
+                st.warning(warning)
+            if not updates:
+                st.info("No safe update fields were found.")
+                return
+            change_rows = []
+            for field, new_value in updates.items():
+                if field == "updated_at":
+                    continue
+                change_rows.append({
+                    "Field": field,
+                    "Current": row.get(field, ""),
+                    "New": new_value,
+                })
+            st.dataframe(pd.DataFrame(change_rows), hide_index=True, width="stretch")
+            a1, a2 = st.columns(2)
+            with a1:
+                if st.button("Apply AI Update", key=f"ai_update_apply_{sale_id}", type="primary", width="stretch"):
+                    get_col().update_one({"id": int(sale_id)}, {"$set": updates})
+                    invalidate_cache()
+                    st.session_state.pop(preview_key, None)
+                    st.success("AI update applied.")
+                    st.rerun()
+            with a2:
+                if st.button("Clear AI Preview", key=f"ai_update_clear_{sale_id}", width="stretch"):
+                    st.session_state.pop(preview_key, None)
+                    st.rerun()
+
 @st.cache_resource
 def get_mongo_client():
     try:
-        try:
-            uri = st.secrets.get("MONGO_URI", os.getenv("MONGO_URI"))
-        except Exception:
-            uri = os.getenv("MONGO_URI")
+        uri = safe_secret("MONGO_URI", os.getenv("MONGO_URI", ""))
         if not uri:
             st.error("⚠️ MONGO_URI not configured.")
             st.stop()
@@ -1500,6 +2113,25 @@ def extract_passbook_pdf_text(file_bytes: bytes) -> str:
         reader = PdfReader(BytesIO(file_bytes))
         return "\n".join(page.extract_text() or "" for page in reader.pages)
 
+def extract_passbook_pdf_tables(file_bytes: bytes) -> list[list[str]]:
+    try:
+        import pdfplumber
+    except ImportError:
+        return []
+
+    rows = []
+    try:
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            for page in pdf.pages:
+                for table in page.extract_tables() or []:
+                    for row in table or []:
+                        cleaned = [clean_text_cell(cell) for cell in (row or [])]
+                        if any(cleaned):
+                            rows.append(cleaned)
+    except Exception:
+        return []
+    return rows
+
 def passbook_field(text: str, pattern: str) -> str:
     match = re.search(pattern, text, flags=re.IGNORECASE)
     return clean_text_cell(match.group(1)) if match else ""
@@ -1509,6 +2141,123 @@ def passbook_amount(value: str) -> float:
         return float(str(value or "0").replace(",", ""))
     except ValueError:
         return 0.0
+
+def passbook_date_value(value: str) -> date:
+    parsed = pd.to_datetime(value, format="%d/%m/%Y", errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(value, dayfirst=True, errors="coerce")
+    return parsed.date() if pd.notna(parsed) else date.today()
+
+def passbook_transaction_name(description: str) -> str:
+    desc = clean_text_cell(description)
+    desc = re.sub(r"^(TO|BY)\s+", "", desc, flags=re.IGNORECASE).strip()
+    parts = [clean_text_cell(part) for part in desc.split("/")]
+    if len(parts) >= 4 and parts[1].upper() in {"DR", "CR"}:
+        return parts[3] or "Unknown"
+    if ":" in desc:
+        return clean_text_cell(desc.split(":", 1)[0]) or "Unknown"
+    return desc[:60] or "Unknown"
+
+def passbook_vendor_key(name: str) -> str:
+    return re.sub(r"\s+", " ", clean_text_cell(name)).strip().casefold()
+
+def passbook_vendor_collection():
+    return get_db()["passbook_vendors"]
+
+def get_saved_passbook_vendors() -> list[str]:
+    docs = list(passbook_vendor_collection().find({}, {"_id": 0, "name": 1}).sort("name", 1))
+    return [clean_text_cell(doc.get("name")) for doc in docs if clean_text_cell(doc.get("name"))]
+
+def save_passbook_vendor(name: str) -> bool:
+    clean_name = clean_text_cell(name)
+    key = passbook_vendor_key(clean_name)
+    if not key:
+        return False
+    passbook_vendor_collection().update_one(
+        {"_id": key},
+        {
+            "$set": {
+                "name": clean_name,
+                "updated_at": str(datetime.now()),
+                "updated_by": st.session_state.get("username", "Admin"),
+            },
+            "$setOnInsert": {"created_at": str(datetime.now())},
+        },
+        upsert=True,
+    )
+    return True
+
+def remove_passbook_vendor(name: str) -> bool:
+    key = passbook_vendor_key(name)
+    if not key:
+        return False
+    passbook_vendor_collection().delete_one({"_id": key})
+    return True
+
+def work_notes_collection():
+    return get_db()["work_notes"]
+
+def get_work_notes(limit: int = 200) -> list[dict]:
+    return list(work_notes_collection().find({}, {"_id": 0}).sort([("work_date", -1), ("created_at", -1)]).limit(limit))
+
+def save_work_note(work_date: date, note: str) -> int:
+    note = clean_text_cell(note)[:1000]
+    existing = work_notes_collection().find_one({}, sort=[("id", -1)], projection={"id": 1, "_id": 0})
+    note_id = int(existing.get("id", 0)) + 1 if existing else 1
+    work_notes_collection().insert_one({
+        "id": note_id,
+        "work_date": str(work_date),
+        "note": note,
+        "created_at": str(datetime.now()),
+        "created_by": st.session_state.get("username", "Admin"),
+    })
+    return note_id
+
+def delete_work_note(note_id: int):
+    work_notes_collection().delete_one({"id": int(note_id)})
+
+def passbook_transaction_row(txn_date: str, description: str, debit: str = "", credit: str = "", balance: str = "") -> dict | None:
+    txn_date = clean_text_cell(txn_date)
+    description = clean_text_cell(description)
+    if not re.match(r"^\d{2}/\d{2}/\d{4}$", txn_date):
+        return None
+    if not re.match(r"^(TO|BY)\b", description, flags=re.IGNORECASE):
+        return None
+    debit_value = passbook_amount(debit)
+    credit_value = passbook_amount(credit)
+    balance_value = passbook_amount(balance)
+    return {
+        "Date": txn_date,
+        "Name": passbook_transaction_name(description),
+        "Description": description,
+        "Debit": debit_value,
+        "Credit": credit_value,
+        "Balance": balance_value,
+    }
+
+def parse_passbook_table_transactions(table_rows: list[list[str]]) -> list[dict]:
+    amount_re = re.compile(r"^\d{1,3}(?:,\d{3})*(?:\.\d{2})$|^\d+(?:\.\d{2})$")
+    rows = []
+    for row in table_rows:
+        cells = [clean_text_cell(cell) for cell in row]
+        if len(cells) < 2:
+            continue
+        if cells[0].upper() == "DATE" or cells[1].upper() == "DESCRIPTION":
+            continue
+        amount_cells = [cell for cell in cells[2:] if amount_re.match(cell)]
+        txn_amount = amount_cells[0] if len(amount_cells) >= 2 else ""
+        balance = amount_cells[-1] if amount_cells else ""
+        direction = cells[1].split(" ", 1)[0].upper() if cells[1] else ""
+        parsed = passbook_transaction_row(
+            cells[0],
+            cells[1],
+            txn_amount if direction == "TO" else "",
+            txn_amount if direction == "BY" else "",
+            balance,
+        )
+        if parsed:
+            rows.append(parsed)
+    return rows
 
 def parse_passbook_transactions(text: str) -> list[dict]:
     amount = r"\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d+(?:\.\d{2})"
@@ -1521,18 +2270,40 @@ def parse_passbook_transactions(text: str) -> list[dict]:
             continue
         txn_date, direction, description, txn_amount, balance = match.groups()
         direction = direction.upper()
-        rows.append({
-            "Date": txn_date,
-            "Description": f"{direction} {description}".strip(),
-            "Debit": passbook_amount(txn_amount) if direction == "TO" else 0.0,
-            "Credit": passbook_amount(txn_amount) if direction == "BY" else 0.0,
-            "Balance": passbook_amount(balance),
-        })
+        full_description = f"{direction} {description}".strip()
+        parsed = passbook_transaction_row(
+            txn_date,
+            full_description,
+            txn_amount if direction == "TO" else "",
+            txn_amount if direction == "BY" else "",
+            balance,
+        )
+        if parsed:
+            rows.append(parsed)
     return rows
+
+def merge_passbook_transactions(*groups: list[dict]) -> list[dict]:
+    merged = []
+    seen = set()
+    for group in groups:
+        for row in group:
+            key = (
+                row.get("Date", ""),
+                row.get("Description", ""),
+                round(money_value(row.get("Debit")), 2),
+                round(money_value(row.get("Credit")), 2),
+                round(money_value(row.get("Balance")), 2),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(row)
+    return merged
 
 @st.cache_data(show_spinner=False)
 def parse_passbook_pdf(file_bytes: bytes, filename: str) -> dict:
     text = extract_passbook_pdf_text(file_bytes)
+    table_rows = extract_passbook_pdf_tables(file_bytes)
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if str(line).strip()]
 
     customer_name = passbook_field(text, r"CUSTOMER\s+DETAILS\s*:\s*(.+)")
@@ -1554,7 +2325,9 @@ def parse_passbook_pdf(file_bytes: bytes, filename: str) -> dict:
                 branch_address = candidate
             break
 
-    transactions = parse_passbook_transactions(text)
+    table_transactions = parse_passbook_table_transactions(table_rows)
+    text_transactions = parse_passbook_transactions(text)
+    transactions = merge_passbook_transactions(table_transactions, text_transactions)
     total_debit = sum(row["Debit"] for row in transactions)
     total_credit = sum(row["Credit"] for row in transactions)
     latest_balance = transactions[-1]["Balance"] if transactions else 0.0
@@ -1579,16 +2352,16 @@ def parse_passbook_pdf(file_bytes: bytes, filename: str) -> dict:
         "raw_text": text,
     }
 
-def render_passbook_sidebar():
-    st.markdown("#### Passbook Reader")
+def page_passbook_reader():
+    page_header("Passbook Reader", "PDF Statement Extractor")
     uploads = st.file_uploader(
-        "Upload passbook PDF",
+        "Upload Passbook PDF",
         type=["pdf"],
         accept_multiple_files=True,
         key="passbook_pdf_uploads",
     )
     if not uploads:
-        st.caption("Upload one or more passbook PDFs to view account details here.")
+        st.info("Upload one or more passbook PDFs. The app will read account details and build a name filter from the transaction table.")
         return
 
     passbooks = []
@@ -1603,64 +2376,287 @@ def render_passbook_sidebar():
     if not passbooks:
         return
 
-    selected_idx = st.selectbox(
-        "Name Filter",
-        list(range(len(passbooks))),
-        format_func=lambda idx: f"{passbooks[idx].get('customer_name') or 'Unknown'} - {passbooks[idx].get('statement_date') or passbooks[idx].get('account_no_15') or passbooks[idx].get('filename')}",
-        key="passbook_name_filter",
-    )
-    pb = passbooks[selected_idx]
-    txns = pb.get("transactions", [])
+    all_rows = []
+    for idx, pb in enumerate(passbooks):
+        for row in pb.get("transactions", []):
+            row_copy = dict(row)
+            row_copy["Passbook"] = pb.get("customer_name", "Unknown")
+            row_copy["Statement Date"] = pb.get("statement_date", "")
+            row_copy["Account"] = pb.get("account_no_15") or pb.get("account_no") or ""
+            row_copy["_passbook_idx"] = idx
+            all_rows.append(row_copy)
 
-    st.markdown(f"**{pb.get('customer_name', 'Unknown')}**")
-    if pb.get("bank"):
-        st.caption(pb["bank"])
-    p1, p2 = st.columns(2)
-    p1.metric("Credits", f"₹{pb.get('total_credit', 0):,.0f}")
-    p2.metric("Debits", f"₹{pb.get('total_debit', 0):,.0f}")
-    st.metric("Balance", f"₹{pb.get('latest_balance', 0):,.2f}")
+    txn_df = pd.DataFrame(all_rows)
+    saved_vendors = get_saved_passbook_vendors()
+    saved_vendor_keys = {passbook_vendor_key(name) for name in saved_vendors}
 
-    with st.expander("Account Details", expanded=True):
-        detail_rows = [
-            ("File", pb.get("filename", "")),
-            ("Branch", pb.get("branch", "")),
-            ("Branch Address", pb.get("branch_address", "")),
-            ("Account No", pb.get("account_no", "")),
-            ("15 Digit A/C", pb.get("account_no_15", "")),
-            ("IFSC", pb.get("ifsc", "")),
-            ("Account Type", pb.get("account_type", "") or "-"),
-            ("Statement Date", pb.get("statement_date", "")),
-            ("Period", pb.get("statement_period", "")),
-            ("Address", pb.get("address", "")),
-        ]
-        for label, value in detail_rows:
-            if value:
-                st.caption(label)
-                st.write(value)
-
-    with st.expander(f"Transactions ({len(txns)})", expanded=False):
-        if txns:
-            txn_df = pd.DataFrame(txns)
-            st.dataframe(txn_df, use_container_width=True, hide_index=True, height=260)
-            st.download_button(
-                "Download CSV",
-                data=txn_df.to_csv(index=False),
-                file_name=f"passbook_{re.sub(r'[^0-9A-Za-z]+', '_', pb.get('customer_name', 'account')).strip('_').lower()}.csv",
-                mime="text/csv",
-                key=f"passbook_csv_{selected_idx}",
-                use_container_width=True,
-            )
-        else:
-            st.info("No transaction rows detected.")
-
-    with st.expander("Extracted Text", expanded=False):
-        st.text_area(
-            "Raw PDF Text",
-            value=pb.get("raw_text", ""),
-            height=180,
-            disabled=True,
-            key=f"passbook_raw_text_{selected_idx}",
+    f1, f2, f3 = st.columns([1.4, 1.4, 1])
+    with f2:
+        selected_idx = st.selectbox(
+            "Passbook",
+            list(range(len(passbooks))),
+            format_func=lambda idx: f"{passbooks[idx].get('customer_name') or 'Unknown'} - {passbooks[idx].get('statement_date') or passbooks[idx].get('account_no_15') or passbooks[idx].get('filename')}",
+            key="passbook_file_filter",
         )
+    passbook_rows = txn_df[txn_df["_passbook_idx"] == selected_idx].copy() if not txn_df.empty else pd.DataFrame()
+    names = []
+    if not passbook_rows.empty and "Name" in passbook_rows.columns:
+        names = sorted([name for name in passbook_rows["Name"].dropna().astype(str).unique() if name.strip()], key=str.casefold)
+    with f1:
+        selected_name = st.selectbox("Name Filter", ["All Names", "Saved Vendors"] + names, key="passbook_transaction_name_filter")
+    with f3:
+        direction_filter = st.selectbox("Type", ["All", "Credit", "Debit"], key="passbook_direction_filter")
+
+    pb = passbooks[selected_idx]
+    filtered = passbook_rows.copy()
+    if selected_name == "Saved Vendors" and not filtered.empty:
+        filtered = filtered[filtered["Name"].astype(str).map(passbook_vendor_key).isin(saved_vendor_keys)]
+    elif selected_name != "All Names" and not filtered.empty:
+        filtered = filtered[filtered["Name"].astype(str).str.casefold().eq(str(selected_name).casefold())]
+    if direction_filter == "Credit" and not filtered.empty:
+        filtered = filtered[filtered["Credit"].map(money_value) > 0]
+    elif direction_filter == "Debit" and not filtered.empty:
+        filtered = filtered[filtered["Debit"].map(money_value) > 0]
+
+    total_credit = float(filtered["Credit"].map(money_value).sum()) if not filtered.empty else 0.0
+    total_debit = float(filtered["Debit"].map(money_value).sum()) if not filtered.empty else 0.0
+    latest_balance = float(filtered["Balance"].map(money_value).iloc[-1]) if not filtered.empty else 0.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Rows", len(filtered))
+    m2.metric("Credits", f"₹{total_credit:,.0f}")
+    m3.metric("Debits", f"₹{total_debit:,.0f}")
+    m4.metric("Last Balance", f"₹{latest_balance:,.2f}")
+
+    a1, a2, a3 = st.columns([1, 1, 2])
+    selected_name_key = passbook_vendor_key(selected_name)
+    selected_is_vendor = selected_name_key in saved_vendor_keys
+    with a1:
+        if selected_name not in ["All Names", "Saved Vendors"]:
+            if selected_is_vendor:
+                if st.button("Remove Vendor", key="passbook_remove_vendor", width="stretch"):
+                    remove_passbook_vendor(selected_name)
+                    st.success(f"{selected_name} removed from saved vendors.")
+                    st.rerun()
+            else:
+                if st.button("Mark as Vendor", key="passbook_mark_vendor", width="stretch"):
+                    if save_passbook_vendor(selected_name):
+                        st.success(f"{selected_name} saved as vendor.")
+                        st.rerun()
+        else:
+            st.button("Mark as Vendor", key="passbook_mark_vendor_disabled", disabled=True, width="stretch")
+    with a2:
+        if saved_vendors:
+            st.metric("Saved Vendors", len(saved_vendors))
+        else:
+            st.metric("Saved Vendors", 0)
+    with a3:
+        if selected_name == "Saved Vendors" and not saved_vendors:
+            st.info("No vendors saved yet. Select a name, then click Mark as Vendor.")
+        elif selected_name == "Saved Vendors":
+            st.caption("Showing transactions for saved vendors only.")
+
+    rule_sm()
+    sec("Transactions")
+    if filtered.empty:
+        st.info("No transaction rows match this filter.")
+    else:
+        show_cols = ["Date", "Name", "Description", "Debit", "Credit", "Balance", "Passbook", "Statement Date", "Account"]
+        show = filtered[[c for c in show_cols if c in filtered.columns]].copy()
+        st.dataframe(show, width="stretch", hide_index=True, height=460)
+        safe_name = re.sub(r"[^0-9A-Za-z]+", "_", selected_name if selected_name != "All Names" else pb.get("customer_name", "passbook")).strip("_").lower()
+        st.download_button(
+            "Download Filtered CSV",
+            data=show.to_csv(index=False),
+            file_name=f"passbook_{safe_name or 'transactions'}_{date.today()}.csv",
+            mime="text/csv",
+            width="stretch",
+            key="passbook_filtered_csv",
+        )
+        passbook_context = "\n\n".join([
+            f"Selected passbook customer: {pb.get('customer_name', 'Unknown')}",
+            f"Statement date: {pb.get('statement_date', '')}",
+            f"Account: {pb.get('account_no_15') or pb.get('account_no') or ''}",
+            f"Selected name filter: {selected_name}",
+            f"Selected type filter: {direction_filter}",
+            "Account details:\n" + pd.DataFrame([
+                {"Field": k, "Value": v}
+                for k, v in pb.items()
+                if k not in {"transactions", "raw_text"}
+            ]).to_csv(index=False),
+            "Filtered passbook transactions:\n" + show.to_csv(index=False),
+        ])
+        render_ai_action_panel(
+            "AI PDF Extraction Assistant",
+            passbook_context,
+            "passbook_ai",
+            {
+                "Summarize transactions": "Summarize these filtered passbook transactions. Give total debit, total credit, repeated names, and anything that needs attention.",
+                "Find vendor payments": "Identify which rows look like boutique vendor purchases. Group by name, total the debit amount, and suggest which names I should save as vendors.",
+                "Suggest sale entries": "Suggest which debit transactions can be converted into boutique sale records. For each one, suggest vendor, category, buying price, and notes.",
+                "Check extraction quality": "Check whether names, dates, debits, credits, and balances look extracted correctly. List suspicious or missing values only.",
+                "Categorize names": "Group the transaction names into likely categories such as boutique vendor, household expense, bank charge, food/grocery, transfer, or unknown.",
+            },
+        )
+
+        rule_sm()
+        sec("Add Sale From Transaction")
+        selectable = show.reset_index(drop=True).copy()
+        selectable["_option"] = selectable.apply(
+            lambda row: f"{row.get('Date', '-')} - {row.get('Name', '-')} - Debit ₹{money_value(row.get('Debit')):,.2f} - Credit ₹{money_value(row.get('Credit')):,.2f}",
+            axis=1,
+        )
+        selected_txn_idx = st.selectbox(
+            "Select Transaction",
+            selectable.index.tolist(),
+            format_func=lambda idx: selectable.loc[idx, "_option"],
+            key="passbook_sale_txn_select",
+        )
+        txn = selectable.loc[selected_txn_idx]
+        txn_amount = money_value(txn.get("Debit")) if money_value(txn.get("Debit")) > 0 else money_value(txn.get("Credit"))
+
+        sale_customer_type = st.radio(
+            "Customer Type",
+            ["Existing Customer", "New Customer"],
+            horizontal=True,
+            key="passbook_sale_customer_type",
+        )
+        existing_customers = get_existing_customers_with_phone()
+        existing_customer_map = {str(customer.get("_id", "")): customer for customer in existing_customers}
+        selected_existing_customer = ""
+        selected_existing_phone = ""
+        if sale_customer_type == "Existing Customer":
+            if existing_customers:
+                selected_existing_customer = st.selectbox(
+                    "Search Existing Customer",
+                    [str(customer.get("_id", "")) for customer in existing_customers],
+                    format_func=lambda name: f"{name} - {existing_customer_map.get(name, {}).get('phone') or 'No phone'}",
+                    key="passbook_sale_existing_customer",
+                )
+                selected_existing_phone = existing_customer_map.get(selected_existing_customer, {}).get("phone", "")
+            else:
+                st.warning("No existing customers found. Use New Customer.")
+                sale_customer_type = "New Customer"
+
+        with st.form("passbook_add_sale_form"):
+            st.caption(f"Vendor, buying price, and sale date are filled from: {txn.get('Description', '')}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if sale_customer_type == "Existing Customer":
+                    sale_customer = st.text_input("Customer Name *", value=selected_existing_customer, disabled=True, key="passbook_sale_customer_existing")
+                else:
+                    sale_customer = st.text_input("Customer Name *", key="passbook_sale_customer_new")
+            with c2:
+                sale_phone = st.text_input("Phone", value=selected_existing_phone, placeholder="+91 XXXXXXXXXX", key=f"passbook_sale_phone_{sale_customer_type.replace(' ', '_').lower()}")
+            with c3:
+                sale_date = st.date_input("Sale Date", value=passbook_date_value(txn.get("Date")), key="passbook_sale_date")
+
+            p1, p2, p3 = st.columns(3)
+            with p1:
+                sale_category = st.selectbox("Category *", CATEGORIES, key="passbook_sale_category")
+            with p2:
+                sale_vendor = st.text_input("Vendor", value=str(txn.get("Name", "") or ""), key="passbook_sale_vendor")
+            with p3:
+                sale_qty = st.number_input("Quantity", min_value=1, step=1, value=1, key="passbook_sale_qty")
+
+            sale_desc = st.text_area("Description", value=str(txn.get("Description", "") or ""), height=70, key="passbook_sale_desc")
+
+            pr1, pr2, pr3, pr4 = st.columns(4)
+            with pr1:
+                sale_buy = st.number_input("Buying Price (₹) *", min_value=0.0, step=1.0, value=float(txn_amount), key="passbook_sale_buy")
+            with pr2:
+                sale_sell = st.number_input("Selling Price (₹) *", min_value=0.0, step=1.0, value=float(txn_amount), key="passbook_sale_sell")
+            with pr3:
+                sale_paid = st.number_input("Amount Paid (₹)", min_value=0.0, step=1.0, value=0.0, key="passbook_sale_paid")
+            with pr4:
+                sale_pm = st.selectbox("Payment Method", PAYMENT_METHODS, index=PAYMENT_METHODS.index("UPI") if "UPI" in PAYMENT_METHODS else 0, key="passbook_sale_payment_method")
+
+            sale_pending = max(round(sale_sell - sale_paid, 2), 0.0)
+            sale_profit = round((sale_sell - sale_buy) * sale_qty, 2)
+            sm1, sm2, sm3 = st.columns(3)
+            sm1.metric("Pending", f"₹{sale_pending:,.2f}")
+            sm2.metric("Profit", f"₹{sale_profit:,.2f}")
+            sm3.metric("Total Value", f"₹{sale_sell * sale_qty:,.2f}")
+
+            sale_notes = st.text_area("Notes", value=f"From passbook transaction: {txn.get('Description', '')}", height=60, key="passbook_sale_notes")
+            save_sale = st.form_submit_button("Save Sale", width="stretch")
+
+        if sale_customer_type == "Existing Customer":
+            sale_customer = selected_existing_customer
+            sale_phone = selected_existing_phone
+
+        if save_sale:
+            errs = []
+            if not str(sale_customer or "").strip():
+                errs.append("Customer name is required.")
+            if sale_buy <= 0:
+                errs.append("Buying price must be > 0.")
+            if sale_sell <= 0:
+                errs.append("Selling price must be > 0.")
+            if sale_paid > sale_sell:
+                errs.append("Amount paid cannot exceed selling price.")
+            if not str(sale_vendor or "").strip():
+                errs.append("Vendor is required.")
+            if len(str(sale_customer)) > 120:
+                errs.append("Customer name must be under 120 characters.")
+            if len(str(sale_phone)) > 20:
+                errs.append("Phone number must be under 20 characters.")
+            if len(str(sale_vendor)) > 100:
+                errs.append("Vendor name must be under 100 characters.")
+            if errs:
+                for err in errs:
+                    st.error(err)
+            else:
+                get_col().insert_one({
+                    "id": get_next_id(),
+                    "customer_name": str(sale_customer).strip()[:120],
+                    "customer_phone": normalize_phone(sale_phone),
+                    "sale_date": str(sale_date),
+                    "vendor": str(sale_vendor).strip()[:100],
+                    "product_category": sale_category,
+                    "product_description": str(sale_desc).strip()[:500],
+                    "quantity": int(sale_qty),
+                    "buying_price": round(float(sale_buy), 2),
+                    "selling_price": round(float(sale_sell), 2),
+                    "amount_paid": round(float(sale_paid), 2),
+                    "pending_amount": sale_pending,
+                    "payment_received": 1 if sale_pending == 0 else 0,
+                    "delay_status": 0,
+                    "payment_method": sale_pm,
+                    "notes": str(sale_notes).strip()[:500],
+                    "passbook_source": {
+                        "date": str(txn.get("Date", "")),
+                        "name": str(txn.get("Name", "")),
+                        "description": str(txn.get("Description", "")),
+                        "debit": money_value(txn.get("Debit")),
+                        "credit": money_value(txn.get("Credit")),
+                        "balance": money_value(txn.get("Balance")),
+                    },
+                    "created_at": str(datetime.now()),
+                })
+                invalidate_cache()
+                st.success(f"Sale added for {str(sale_customer).strip()} from passbook transaction.")
+                st.rerun()
+
+    with st.expander("Saved Vendors", expanded=False):
+        if saved_vendors:
+            vendor_df = pd.DataFrame({"Vendor Name": saved_vendors})
+            st.dataframe(vendor_df, width="stretch", hide_index=True, height=220)
+            remove_name = st.selectbox("Remove Saved Vendor", saved_vendors, key="passbook_saved_vendor_remove_select")
+            if st.button("Remove Selected Vendor", key="passbook_saved_vendor_remove", width="stretch"):
+                remove_passbook_vendor(remove_name)
+                st.success(f"{remove_name} removed from saved vendors.")
+                st.rerun()
+        else:
+            st.info("No saved vendors yet.")
+
+    with st.expander("All Names Found", expanded=False):
+        if names:
+            name_counts = txn_df[txn_df["_passbook_idx"] == selected_idx]["Name"].value_counts().reset_index()
+            name_counts.columns = ["Name", "Transactions"]
+            st.dataframe(name_counts, width="stretch", hide_index=True, height=320)
+        else:
+            st.info("No names found in the uploaded passbook transactions.")
 
 def make_upi_qr_png(amount: float = 0.0) -> BytesIO:
     try:
@@ -1857,7 +2853,7 @@ def render_customer_bill_download(df: pd.DataFrame, customer_name: str, key: str
         chosen_limit = normalize_bill_limit(bill_limit)
     scope_key = re.sub(r"[^0-9A-Za-z]+", "_", bill_scope_label(chosen_scope, chosen_limit)).strip("_").lower()
     state_key = f"{key}_{scope_key}_bill_download"
-    if st.button(label, key=f"{key}_create", use_container_width=True):
+    if st.button(label, key=f"{key}_create", width="stretch"):
         try:
             bill_doc = create_bill_history_record(df, customer_name, bill_date=bill_date or date.today(), bill_scope=chosen_scope, bill_limit=chosen_limit)
             bill_pdf = generate_customer_bill_pdf(df, customer_name, bill_date=bill_date or date.today(), bill_id=bill_doc["bill_id"], bill_scope=chosen_scope, bill_limit=chosen_limit)
@@ -1884,7 +2880,7 @@ def render_customer_bill_download(df: pd.DataFrame, customer_name: str, key: str
             file_name=bill_file_name(payload["customer_name"], payload["bill_id"]),
             mime="application/pdf",
             key=f"{key}_download",
-            use_container_width=True,
+            width="stretch",
         )
 
 def vendor_picker(label: str, key_prefix: str, current: str = "") -> str:
@@ -1920,12 +2916,11 @@ def page_add_sale(public=False):
     else:
         page_header("New Sale", "Record a Transaction")
 
-    ctype = st.radio(
-        "Customer Type",
-        ["New Customer", "Existing Customer"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
+    if not public:
+        render_ai_sale_entry_assistant()
+        rule()
+
+    ctype = st.radio("Customer type", ["New Customer", "Existing Customer"], horizontal=True, label_visibility="collapsed")
     rule_sm()
 
     cname, cphone = "", ""
@@ -1989,7 +2984,13 @@ def page_add_sale(public=False):
         with pr1: _, buy, buy_ok           = currency_input("Buying Price (₹) *", "sale_buying_price")
         with pr2: _, sell, sell_ok         = currency_input("Selling Price (₹) *", "sale_selling_price")
         with pr3: _, paid_amt, paid_ok     = currency_input("Amount Paid (₹)", "sale_amount_paid")
-        with pr4: pm       = st.selectbox("Payment Method", PAYMENT_METHODS)
+        with pr4:
+            pm = st.selectbox(
+                "Payment Method",
+                PAYMENT_METHODS,
+                index=PAYMENT_METHODS.index("UPI") if "UPI" in PAYMENT_METHODS else 0,
+                key="sale_payment_method",
+            )
 
         pending_amt = max(round(sell - paid_amt, 2), 0.0)
         profit_amt  = round((sell - buy) * qty, 2)
@@ -2003,7 +3004,7 @@ def page_add_sale(public=False):
 
         notes = st.text_area("Notes", placeholder="Special instructions…", height=60)
 
-        submitted = st.form_submit_button("Save Sale", use_container_width=True)
+        submitted = st.form_submit_button("Save Sale", width="stretch")
 
         if submitted:
             # ── Public form rate limiting ────────────────────────────────
@@ -2076,12 +3077,546 @@ def page_add_sale(public=False):
 _MAX_ATTEMPTS   = 5
 _LOCKOUT_SECS   = 300   # 5-minute lockout after max attempts
 _BACKOFF_BASE   = 1.5   # seconds — doubles each attempt after 1st failure
-_QR_TOKEN_PREFIX = "SKB-QR1"
-_QR_TOKEN_BYTES = 48
-_QR_DEFAULT_MINUTES = 15
-_QR_MAX_DAYS = 7
+_FACE_MATCH_TOLERANCE = 0.46
+_TEMP_QR_TYPE = "boutique_temp_login"
+_FACE_VECTOR_VERSION = "dlib_128d_v1"
 _KEY_DEFAULT_DAYS = 30
 _KEY_MAX_DAYS = 365
+
+def _bcrypt_lib():
+    import bcrypt
+    return bcrypt
+
+def auth_faces_collection():
+    return get_db()["auth_faces"]
+
+def auth_qr_collection():
+    return get_db()["auth_temp_qr_logins"]
+
+def auth_devices_collection():
+    return get_db()["auth_login_devices"]
+
+def auth_keys_collection():
+    return get_db()["auth_encrypted_key_logins"]
+
+@st.cache_resource
+def ensure_auth_indexes():
+    try:
+        auth_faces_collection().create_index([("active", 1), ("name", 1)])
+        auth_qr_collection().create_index([("active", 1), ("expires_at", 1)])
+        auth_devices_collection().create_index([("active", 1), ("last_login_at", -1)])
+        auth_keys_collection().create_index([("active", 1), ("expires_at", 1)])
+        auth_keys_collection().create_index("public_key_hash", unique=True)
+    except Exception:
+        pass
+
+def _new_auth_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+def _get_face_match_tolerance() -> float:
+    raw = safe_secret("FACE_MATCH_TOLERANCE", "") or os.getenv("FACE_MATCH_TOLERANCE", "")
+    try:
+        if raw:
+            return min(max(float(raw), 0.35), 0.60)
+    except Exception:
+        pass
+    return _FACE_MATCH_TOLERANCE
+
+@st.cache_resource
+def _load_cv_libs():
+    try:
+        import cv2
+        import numpy as np
+        return cv2, np, ""
+    except Exception as exc:
+        return None, None, str(exc)
+
+@st.cache_resource
+def _load_face_tools():
+    try:
+        cv2, np, error = _load_cv_libs()
+        if error:
+            return None, None, None, None, error
+        try:
+            import face_recognition
+            return cv2, np, face_recognition, "face_recognition", ""
+        except Exception:
+            import dlib
+            import face_recognition_models
+            detector = dlib.get_frontal_face_detector()
+            pose_predictor = dlib.shape_predictor(face_recognition_models.pose_predictor_model_location())
+            face_encoder = dlib.face_recognition_model_v1(face_recognition_models.face_recognition_model_location())
+            tools = {
+                "detector": detector,
+                "pose_predictor": pose_predictor,
+                "face_encoder": face_encoder,
+                "dlib": dlib,
+            }
+            return cv2, np, tools, "dlib", ""
+    except Exception as exc:
+        return None, None, None, None, str(exc)
+
+def _cv_dependency_message(error: str) -> str:
+    return (
+        "Camera and QR processing need OpenCV and numpy installed. "
+        f"Dependency error: {error}"
+    )
+
+def _vision_dependency_message(error: str) -> str:
+    return (
+        "Camera login needs OpenCV, numpy, dlib-bin, and face-recognition-models installed. "
+        f"Dependency error: {error}"
+    )
+
+def _uploaded_file_to_bgr(uploaded_file):
+    cv2, np, error = _load_cv_libs()
+    if error:
+        return None, _cv_dependency_message(error)
+    if uploaded_file is None:
+        return None, "Capture an image first."
+    raw = uploaded_file.getvalue()
+    if not raw:
+        return None, "The captured image is empty."
+    image_array = np.frombuffer(raw, dtype=np.uint8)
+    image_bgr = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        return None, "Could not read the captured image."
+    return image_bgr, ""
+
+def extract_face_encoding(uploaded_file):
+    cv2, np, face_tools, backend, error = _load_face_tools()
+    if error:
+        return None, _vision_dependency_message(error)
+    image_bgr, error = _uploaded_file_to_bgr(uploaded_file)
+    if error:
+        return None, error
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    if backend == "face_recognition":
+        locations = face_tools.face_locations(image_rgb, model="hog")
+        if not locations:
+            return None, "No face was found. Try brighter light and keep your face centered."
+        if len(locations) > 1:
+            return None, "Multiple faces were found. Capture only one person."
+        encodings = face_tools.face_encodings(image_rgb, known_face_locations=locations)
+        if not encodings:
+            return None, "Could not convert this face into a Face ID vector."
+        return [float(v) for v in encodings[0]], ""
+
+    dlib = face_tools["dlib"]
+    rectangles = list(face_tools["detector"](image_rgb, 1))
+    if not rectangles:
+        return None, "No face was found. Try brighter light and keep your face centered."
+    if len(rectangles) > 1:
+        return None, "Multiple faces were found. Capture only one person."
+    shape = face_tools["pose_predictor"](image_rgb, rectangles[0])
+    encoding = face_tools["face_encoder"].compute_face_descriptor(image_rgb, shape)
+    return [float(v) for v in np.array(encoding, dtype="float64")], ""
+
+def _find_matching_face(encoding: list[float]):
+    _, np, error = _load_cv_libs()
+    if error:
+        return None, None, _cv_dependency_message(error)
+
+    docs = list(auth_faces_collection().find(
+        {"active": {"$ne": False}},
+        {"encoding": 1, "name": 1, "role": 1, "created_at": 1, "last_login_at": 1},
+    ))
+    if not docs:
+        return None, None, "No Face IDs are enrolled yet."
+
+    known = []
+    candidates = []
+    for doc in docs:
+        stored = doc.get("encoding")
+        if isinstance(stored, list) and len(stored) == len(encoding):
+            known.append(stored)
+            candidates.append(doc)
+
+    if not candidates:
+        return None, None, "No valid Face ID vectors are saved."
+
+    distances = np.linalg.norm(
+        np.array(known, dtype="float64") - np.array(encoding, dtype="float64"),
+        axis=1,
+    )
+    best_idx = int(np.argmin(distances))
+    best_distance = float(distances[best_idx])
+    if best_distance <= _get_face_match_tolerance():
+        return candidates[best_idx], best_distance, ""
+    return None, best_distance, "Face ID not recognized."
+
+def save_face_profile(name: str, role: str, encoding: list[float], created_via: str, qr_token_id: str | None = None) -> str:
+    face_id = _new_auth_id("face")
+    auth_faces_collection().insert_one({
+        "_id": face_id,
+        "name": name.strip()[:120],
+        "role": role if role in {"admin", "member"} else "member",
+        "encoding": encoding,
+        "vector_version": _FACE_VECTOR_VERSION,
+        "active": True,
+        "created_via": created_via,
+        "qr_token_id": qr_token_id,
+        "created_by": st.session_state.get("username", "System"),
+        "created_at": datetime.now(),
+        "last_login_at": None,
+        "login_count": 0,
+    })
+    return face_id
+
+def _hash_temp_qr_secret(secret_value: str) -> str:
+    return hashlib.sha256(f"{_TEMP_QR_TYPE}:{secret_value}".encode()).hexdigest()
+
+def _hash_pin(pin: str) -> str:
+    bcrypt = _bcrypt_lib()
+    return bcrypt.hashpw(pin.encode(), bcrypt.gensalt()).decode()
+
+def _check_pin(pin: str, pin_hash: str) -> bool:
+    try:
+        bcrypt = _bcrypt_lib()
+        return bcrypt.checkpw(pin.encode(), pin_hash.encode())
+    except Exception:
+        return False
+
+def make_temp_login_qr_png(payload: str) -> bytes:
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise RuntimeError("Install qrcode[pil] to generate temporary login QR codes.") from exc
+    qr = qrcode.QRCode(box_size=8, border=2)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    out = BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+def create_temp_qr_invite(member_name: str, pin: str, expires_hours: int) -> dict:
+    token_id = _new_auth_id("qr")
+    token_secret = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(hours=int(expires_hours))
+    payload = {
+        "type": _TEMP_QR_TYPE,
+        "token_id": token_id,
+        "secret": token_secret,
+    }
+    auth_qr_collection().insert_one({
+        "_id": token_id,
+        "member_name": member_name.strip()[:120],
+        "secret_hash": _hash_temp_qr_secret(token_secret),
+        "pin_hash": _hash_pin(pin),
+        "active": True,
+        "expires_at": expires_at,
+        "created_at": datetime.now(),
+        "created_by": st.session_state.get("username", "Admin"),
+        "pin_failures": 0,
+        "used_at": None,
+        "face_id": None,
+    })
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    return {
+        "token_id": token_id,
+        "member_name": member_name.strip()[:120],
+        "expires_at": expires_at,
+        "payload_json": payload_json,
+        "qr_png": make_temp_login_qr_png(payload_json),
+    }
+
+def _decode_qr_payload(uploaded_file):
+    cv2, _, error = _load_cv_libs()
+    if error:
+        return None, _cv_dependency_message(error)
+    image_bgr, error = _uploaded_file_to_bgr(uploaded_file)
+    if error:
+        return None, error
+    detector = cv2.QRCodeDetector()
+    decoded, _, _ = detector.detectAndDecode(image_bgr)
+    if not decoded:
+        try:
+            ok, decoded_info, _, _ = detector.detectAndDecodeMulti(image_bgr)
+            if ok:
+                decoded = next((item for item in decoded_info if item), "")
+        except Exception:
+            decoded = ""
+    if not decoded:
+        return None, "No QR code was detected. Hold the QR clearly in the camera frame."
+    try:
+        payload = json.loads(decoded)
+    except Exception:
+        return None, "This QR code is not a boutique login QR."
+    if payload.get("type") != _TEMP_QR_TYPE:
+        return None, "This QR code is not a boutique login QR."
+    if not payload.get("token_id") or not payload.get("secret"):
+        return None, "This QR code is missing login data."
+    return payload, ""
+
+def _lookup_temp_qr(payload: dict):
+    doc = auth_qr_collection().find_one({"_id": payload.get("token_id")})
+    if not doc:
+        return None, "This QR login has not been found."
+    expected = _hash_temp_qr_secret(str(payload.get("secret", "")))
+    if not hmac.compare_digest(str(doc.get("secret_hash", "")), expected):
+        return None, "This QR login is not valid."
+    if not doc.get("active", True) or doc.get("used_at"):
+        return None, "This QR login has already been used or revoked."
+    expires_at = doc.get("expires_at")
+    if isinstance(expires_at, datetime) and expires_at < datetime.now():
+        return None, "This QR login has expired."
+    return doc, ""
+
+def _verify_temp_qr_pin(payload: dict, pin: str):
+    doc, error = _lookup_temp_qr(payload)
+    if error:
+        return None, error
+    if _check_pin(pin, str(doc.get("pin_hash", ""))):
+        return doc, ""
+
+    failures = int(doc.get("pin_failures", 0)) + 1
+    update = {"$set": {"pin_failures": failures}}
+    if failures >= _MAX_ATTEMPTS:
+        update["$set"]["active"] = False
+        update["$set"]["revoked_reason"] = "too_many_pin_failures"
+    auth_qr_collection().update_one({"_id": doc["_id"]}, update)
+    if failures >= _MAX_ATTEMPTS:
+        return None, "Too many wrong PIN attempts. This QR login is now revoked."
+    return None, f"Invalid PIN. {max(_MAX_ATTEMPTS - failures, 0)} attempt(s) remaining."
+
+def _mark_temp_qr_used(token_id: str, face_id: str | None = None):
+    auth_qr_collection().update_one(
+        {"_id": token_id},
+        {"$set": {
+            "active": False,
+            "used_at": datetime.now(),
+            "face_id": face_id,
+        }},
+    )
+
+def _load_key_crypto():
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except ImportError as exc:
+        raise RuntimeError("Install cryptography to use encrypted key login.") from exc
+    return serialization, rsa
+
+def _clean_key_label(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:120]
+
+def _private_key_public_hash(private_key) -> str:
+    serialization, _ = _load_key_crypto()
+    public_der = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(public_der).hexdigest()
+
+def _format_key_fingerprint(public_key_hash: str) -> str:
+    short_hash = str(public_key_hash or "")[:32]
+    return ":".join(short_hash[i:i + 2] for i in range(0, len(short_hash), 2))
+
+def _load_private_key_from_pem(pem_text: str, passphrase: str = ""):
+    serialization, _ = _load_key_crypto()
+    raw = str(pem_text or "").strip().encode("utf-8")
+    if not raw:
+        raise ValueError("Upload or paste a private key first.")
+    password = str(passphrase or "").encode("utf-8") or None
+    try:
+        return serialization.load_pem_private_key(raw, password=password)
+    except TypeError as exc:
+        if password:
+            raise ValueError("Private key passphrase is incorrect.") from exc
+        raise ValueError("This private key is encrypted. Enter its passphrase.") from exc
+    except ValueError as exc:
+        raise ValueError("Invalid private key. Upload or paste a valid PEM private key.") from exc
+
+def _encrypted_key_status(doc: dict) -> str:
+    expires_at = doc.get("expires_at")
+    uses = int(doc.get("uses", 0) or 0)
+    max_uses = int(doc.get("max_uses", 0) or 0)
+    if not doc.get("active", True) or doc.get("revoked_at"):
+        return "Revoked"
+    if isinstance(expires_at, datetime) and expires_at <= datetime.now():
+        return "Expired"
+    if max_uses and uses >= max_uses:
+        return "Used"
+    return "Active"
+
+def create_encrypted_key_login(for_user: str, role: str, valid_days: int, max_uses: int = 0, note: str = "") -> tuple[bytes, dict]:
+    serialization, rsa = _load_key_crypto()
+    for_user = _clean_key_label(for_user)
+    if not for_user:
+        raise ValueError("Enter who this encrypted key is for.")
+    role = role if role in {"admin", "member"} else "member"
+    valid_days = max(1, min(int(valid_days or _KEY_DEFAULT_DAYS), _KEY_MAX_DAYS))
+    max_uses = max(0, min(int(max_uses or 0), 1000))
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_key_hash = _private_key_public_hash(private_key)
+    now = datetime.now()
+    doc = {
+        "_id": _new_auth_id("key"),
+        "public_key_hash": public_key_hash,
+        "fingerprint": _format_key_fingerprint(public_key_hash),
+        "for_user": for_user,
+        "role": role,
+        "active": True,
+        "created_by": st.session_state.get("username", "Admin"),
+        "created_at": now,
+        "expires_at": now + timedelta(days=valid_days),
+        "uses": 0,
+        "max_uses": max_uses,
+        "note": str(note or "").strip()[:200],
+    }
+    auth_keys_collection().insert_one(doc.copy())
+    return private_pem, doc
+
+def consume_encrypted_key_login(pem_text: str, passphrase: str = "") -> tuple[bool, str, dict | None]:
+    try:
+        private_key = _load_private_key_from_pem(pem_text, passphrase=passphrase)
+    except Exception as exc:
+        return False, str(exc), None
+    public_key_hash = _private_key_public_hash(private_key)
+    doc = auth_keys_collection().find_one({"public_key_hash": public_key_hash})
+    if not doc:
+        return False, "Encrypted key was not found. Generate a valid key first.", None
+    status = _encrypted_key_status(doc)
+    if status == "Revoked":
+        return False, "This encrypted key has been revoked.", None
+    if status == "Expired":
+        return False, "This encrypted key has expired. Generate a fresh key.", None
+    if status == "Used":
+        return False, "This encrypted key has reached its allowed login limit.", None
+    uses = int(doc.get("uses", 0) or 0)
+    result = auth_keys_collection().update_one(
+        {
+            "_id": doc["_id"],
+            "public_key_hash": public_key_hash,
+            "uses": uses,
+            "active": True,
+            "expires_at": {"$gt": datetime.now()},
+        },
+        {
+            "$inc": {"uses": 1},
+            "$set": {"last_used_at": datetime.now(), "last_used_by": doc.get("for_user", "Key User")},
+        },
+    )
+    if result.modified_count != 1:
+        return False, "This encrypted key is no longer valid. Generate a fresh key.", None
+    doc["uses"] = uses + 1
+    doc["last_used_at"] = datetime.now()
+    return True, "Encrypted key accepted.", doc
+
+def _request_device_details() -> dict:
+    headers = {}
+    try:
+        headers = dict(st.context.headers)
+    except Exception:
+        headers = {}
+    user_agent = headers.get("user-agent", "") or headers.get("User-Agent", "")
+    ip_addr = headers.get("x-forwarded-for", "") or headers.get("X-Forwarded-For", "")
+    lower = user_agent.lower()
+    if "iphone" in lower:
+        device = "iPhone"
+    elif "ipad" in lower:
+        device = "iPad"
+    elif "macintosh" in lower or "mac os" in lower:
+        device = "Mac"
+    elif "windows" in lower:
+        device = "Windows"
+    elif "android" in lower:
+        device = "Android"
+    else:
+        device = "Browser"
+    if "chrome" in lower:
+        browser = "Chrome"
+    elif "safari" in lower:
+        browser = "Safari"
+    elif "firefox" in lower:
+        browser = "Firefox"
+    elif "edge" in lower:
+        browser = "Edge"
+    else:
+        browser = "Web"
+    signature = hashlib.sha256(f"{user_agent}|{ip_addr}".encode()).hexdigest()[:18]
+    return {
+        "label": f"{browser} on {device}",
+        "signature": signature,
+        "user_agent": user_agent[:500],
+        "ip": ip_addr[:120],
+    }
+
+def establish_login(username: str, role: str = "member", method: str = "face", face_id: str | None = None, qr_token_id: str | None = None):
+    device_id = st.session_state.get("auth_device_id")
+    if device_id:
+        existing_device = auth_devices_collection().find_one({"_id": device_id}, {"active": 1})
+        if existing_device and existing_device.get("active") is False:
+            device_id = None
+    if not device_id:
+        device_id = _new_auth_id("device")
+        st.session_state.auth_device_id = device_id
+
+    details = _request_device_details()
+    now = datetime.now()
+    auth_devices_collection().update_one(
+        {"_id": device_id},
+        {
+            "$set": {
+                "user_name": username.strip()[:120] or "Member",
+                "role": role,
+                "method": method,
+                "face_id": face_id,
+                "qr_token_id": qr_token_id,
+                "label": details["label"],
+                "signature": details["signature"],
+                "user_agent": details["user_agent"],
+                "ip": details["ip"],
+                "last_login_at": now,
+                "active": True,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+    if face_id:
+        auth_faces_collection().update_one(
+            {"_id": face_id},
+            {"$set": {"last_login_at": now}, "$inc": {"login_count": 1}},
+        )
+    st.session_state.logged_in = True
+    st.session_state.username = username.strip()[:120] or "Member"
+    st.session_state.user_role = role
+    st.session_state.auth_method = method
+    st.session_state.face_id = face_id
+
+def _current_auth_device_revoked() -> bool:
+    device_id = st.session_state.get("auth_device_id")
+    if not device_id:
+        return False
+    doc = auth_devices_collection().find_one({"_id": device_id}, {"active": 1})
+    return bool(doc and doc.get("active") is False)
+
+def _is_admin() -> bool:
+    return st.session_state.get("user_role", "admin") == "admin"
+
+def _clear_auth_state():
+    for key in (
+        "logged_in",
+        "username",
+        "user_role",
+        "auth_method",
+        "face_id",
+        "pending_qr_payload",
+        "pending_qr_member",
+        "pending_qr_token_id",
+        "pending_qr_pin_ok",
+        "generated_temp_qr",
+        "auth_device_id",
+    ):
+        st.session_state.pop(key, None)
+    st.session_state.logged_in = False
 
 def _get_stored_hash() -> bytes | None:
     """
@@ -2095,19 +3630,15 @@ def _get_stored_hash() -> bytes | None:
 
     If none of these are set the function returns None and login is blocked.
     """
-    try:
-        secrets = st.secrets
-    except Exception:
-        secrets = {}
-
     # 1. Pre-hashed secret
-    h = secrets.get("PASSWORD_HASH") or os.getenv("PASSWORD_HASH", "")
+    h = safe_secret("PASSWORD_HASH", "") or os.getenv("PASSWORD_HASH", "")
     if h:
         return h.encode() if isinstance(h, str) else h
 
     # 2. Plain-text secret — hash on the fly (one-time cost per cold start)
-    p = secrets.get("PASSWORD") or os.getenv("PASSWORD", "")
+    p = safe_secret("PASSWORD", "") or os.getenv("PASSWORD", "")
     if p:
+        bcrypt = _bcrypt_lib()
         return bcrypt.hashpw(p.encode(), bcrypt.gensalt())
 
     # Nothing configured — fail closed
@@ -2115,10 +3646,7 @@ def _get_stored_hash() -> bytes | None:
 
 
 def _get_username() -> str | None:
-    try:
-        u = st.secrets.get("USERNAME") or os.getenv("USERNAME", "")
-    except Exception:
-        u = os.getenv("USERNAME", "")
+    u = safe_secret("USERNAME", "") or os.getenv("USERNAME", "")
     return u.strip() or None
 
 
@@ -2158,6 +3686,7 @@ def _verify_credentials(username: str, password: str) -> bool:
     user_ok = hmac.compare_digest(username.encode(), stored_user.encode())
     # bcrypt compare (constant-time internally)
     try:
+        bcrypt = _bcrypt_lib()
         pass_ok = bcrypt.checkpw(password.encode(), stored_hash)
     except Exception:
         pass_ok = False
@@ -2165,571 +3694,139 @@ def _verify_credentials(username: str, password: str) -> bool:
     return user_ok and pass_ok
 
 
-def _qr_login_collection():
-    return get_db()["qr_login_tokens"]
-
-
-def _key_login_collection():
-    return get_db()["encrypted_key_logins"]
-
-
-def _qr_login_now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _as_utc_naive(value) -> datetime | None:
-    if isinstance(value, datetime):
-        if value.tzinfo is not None:
-            return value.astimezone(timezone.utc).replace(tzinfo=None)
-        return value
-    text = str(value or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        if parsed.tzinfo is not None:
-            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
-    except ValueError:
-        return None
-
-
-def _format_qr_dt(value) -> str:
-    dt = _as_utc_naive(value)
-    return dt.strftime("%d %b %Y, %I:%M %p") if dt else "-"
-
-
-def _clean_qr_subject(value: str) -> str:
-    subject = re.sub(r"\s+", " ", str(value or "")).strip()
-    return subject[:80]
-
-
-def _new_qr_login_token() -> str:
-    return f"{_QR_TOKEN_PREFIX}.{py_secrets.token_urlsafe(_QR_TOKEN_BYTES)}"
-
-
-def _qr_token_hash(token: str) -> str:
-    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
-
-
-def _extract_qr_login_token(payload: str) -> str:
-    text = str(payload or "").strip()
-    if not text:
-        return ""
-
-    parsed = urlparse(text)
-    if parsed.query:
-        params = parse_qs(parsed.query)
-        for key in ("qr_login", "token", "code"):
-            values = params.get(key)
-            if values:
-                text = str(values[0] or "").strip()
-                break
-
-    return text if text.startswith(f"{_QR_TOKEN_PREFIX}.") else ""
-
-
-def _build_qr_payload(token: str, app_url: str = "") -> str:
-    app_url = str(app_url or "").strip()
-    if not app_url:
-        return token
-    joiner = "&" if "?" in app_url else "?"
-    return f"{app_url}{joiner}{urlencode({'qr_login': token})}"
-
-
-def _qr_png_bytes(payload: str) -> BytesIO:
-    if qrcode is None:
-        raise RuntimeError("Install qrcode[pil] to generate QR login images.")
-
-    qr = qrcode.QRCode(
-        version=None,
-        error_correction=qrcode.constants.ERROR_CORRECT_Q,
-        box_size=9,
-        border=3,
-    )
-    qr.add_data(payload)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="#0F172A", back_color="white").convert("RGB")
-    out = BytesIO()
-    img.save(out, format="PNG")
-    out.seek(0)
-    return out
-
-
-def _decode_qr_image(file_obj) -> tuple[str, str | None]:
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        return "", "QR image scanning is not available on this server. Use the QR token paste box or generate a QR with an App Login URL."
-
-    try:
-        raw = file_obj.getvalue()
-        arr = np.frombuffer(raw, dtype=np.uint8)
-        image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception:
-        image = None
-
-    if image is None:
-        return "", "Could not read that image. Try a clearer QR photo."
-
-    detector = cv2.QRCodeDetector()
-    data, _, _ = detector.detectAndDecode(image)
-    if not data and hasattr(detector, "detectAndDecodeMulti"):
-        try:
-            ok, decoded_info, _, _ = detector.detectAndDecodeMulti(image)
-            if ok:
-                data = next((item for item in decoded_info if item), "")
-        except Exception:
-            data = ""
-
-    data = str(data or "").strip()
-    if not data:
-        return "", "No QR code was detected. Try better lighting or upload the QR image."
-    return data, None
-
-
-def _qr_login_status(doc: dict, now: datetime | None = None) -> str:
-    now = now or _qr_login_now()
-    expires_at = _as_utc_naive(doc.get("expires_at"))
-    uses = int(doc.get("uses", 0) or 0)
-    max_uses = max(int(doc.get("max_uses", 1) or 1), 1)
-
-    if doc.get("revoked_at"):
-        return "Revoked"
-    if expires_at and expires_at <= now:
-        return "Expired"
-    if uses >= max_uses:
-        return "Used"
-    return "Active"
-
-
-def create_qr_login(for_user: str, valid_minutes: int, max_uses: int, note: str = "", app_url: str = "") -> tuple[str, dict]:
-    for_user = _clean_qr_subject(for_user)
-    if not for_user:
-        raise ValueError("Enter who this QR login is for.")
-
-    valid_minutes = max(1, min(int(valid_minutes or _QR_DEFAULT_MINUTES), _QR_MAX_DAYS * 24 * 60))
-    max_uses = max(1, min(int(max_uses or 1), 20))
-    now = _qr_login_now()
-    token = _new_qr_login_token()
-    doc = {
-        "token_hash": _qr_token_hash(token),
-        "for_user": for_user,
-        "created_by": st.session_state.get("username", "Admin"),
-        "created_at": now,
-        "expires_at": now + timedelta(minutes=valid_minutes),
-        "uses": 0,
-        "max_uses": max_uses,
-        "note": str(note or "").strip()[:200],
-        "app_url": str(app_url or "").strip()[:300],
-    }
-    result = _qr_login_collection().insert_one(doc.copy())
-    doc["_id"] = result.inserted_id
-    return token, doc
-
-
-def consume_qr_login(payload: str) -> tuple[bool, str, dict | None]:
-    token = _extract_qr_login_token(payload)
-    if not token:
-        return False, "This QR code is not a valid boutique login code.", None
-
-    token_hash = _qr_token_hash(token)
-    doc = _qr_login_collection().find_one({"token_hash": token_hash})
-    if not doc:
-        return False, "QR login was not found. It may have been revoked or generated for another app.", None
-
-    status = _qr_login_status(doc)
-    if status == "Revoked":
-        return False, "This QR login has been revoked.", None
-    if status == "Expired":
-        return False, "This QR login has expired. Generate a fresh QR code.", None
-    if status == "Used":
-        return False, "This QR login has already reached its allowed scan limit.", None
-
-    uses = int(doc.get("uses", 0) or 0)
-    now = _qr_login_now()
-    result = _qr_login_collection().update_one(
-        {
-            "_id": doc["_id"],
-            "token_hash": token_hash,
-            "uses": uses,
-            "expires_at": {"$gt": now},
-            "$or": [{"revoked_at": {"$exists": False}}, {"revoked_at": None}],
-        },
-        {
-            "$inc": {"uses": 1},
-            "$set": {
-                "last_used_at": now,
-                "last_used_by": _clean_qr_subject(doc.get("for_user")) or "QR User",
-            },
-        },
-    )
-    if result.modified_count != 1:
-        return False, "This QR login is no longer valid. Generate a fresh QR code.", None
-
-    doc["uses"] = uses + 1
-    doc["last_used_at"] = now
-    return True, "QR login accepted.", doc
-
-
-def _complete_qr_login(doc: dict):
-    username = _clean_qr_subject(doc.get("for_user")) or "QR User"
-    st.session_state.logged_in = True
-    st.session_state.username = username
-    st.session_state.auth_method = "qr"
-    st.session_state.login_attempts = 0
-    st.session_state.login_lock_until = 0
-
-
-def _process_qr_login_payload(payload: str) -> bool:
-    ok, message, doc = consume_qr_login(payload)
-    if ok and doc:
-        _complete_qr_login(doc)
-        st.session_state.qr_login_success = f"Signed in with QR code as {doc.get('for_user', 'QR User')}."
-        st.rerun()
-        return True
-    st.error(message)
-    return False
-
-
-def _get_qr_query_payload() -> str:
-    try:
-        value = st.query_params.get("qr_login", "")
-    except Exception:
-        try:
-            value = st.experimental_get_query_params().get("qr_login", "")
-        except Exception:
-            value = ""
-    if isinstance(value, list):
-        value = value[0] if value else ""
-    return str(value or "").strip()
-
-
-def _clear_qr_query_payload():
-    try:
-        if "qr_login" in st.query_params:
-            del st.query_params["qr_login"]
-        return
-    except Exception:
-        pass
-    try:
-        st.experimental_set_query_params()
-    except Exception:
-        pass
-
-
-def handle_qr_query_login():
-    payload = _get_qr_query_payload()
-    if not payload:
-        return
-    ok, message, doc = consume_qr_login(payload)
-    _clear_qr_query_payload()
-    if ok and doc:
-        _complete_qr_login(doc)
-        st.session_state.qr_login_success = f"Signed in with QR code as {doc.get('for_user', 'QR User')}."
-        st.rerun()
-    else:
-        st.session_state.qr_login_error = message
-
-
-def get_qr_login_docs(limit: int = 50) -> list[dict]:
-    try:
-        return list(_qr_login_collection().find({}, {"token_hash": 0}).sort("created_at", -1).limit(limit))
-    except Exception:
-        return []
-
-
-def _crypto_available() -> bool:
-    return serialization is not None and rsa is not None
-
-
-def _clean_key_label(value: str) -> str:
-    label = re.sub(r"\s+", " ", str(value or "")).strip()
-    return label[:80]
-
-
-def _private_key_public_hash(private_key) -> str:
-    public_der = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    return hashlib.sha256(public_der).hexdigest()
-
-
-def _format_key_fingerprint(public_key_hash: str) -> str:
-    short_hash = str(public_key_hash or "")[:32]
-    return ":".join(short_hash[i:i + 2] for i in range(0, len(short_hash), 2))
-
-
-def _load_private_key_from_pem(pem_text: str, passphrase: str = ""):
-    if not _crypto_available():
-        raise RuntimeError("Install cryptography to use encrypted key login.")
-
-    raw = str(pem_text or "").strip().encode("utf-8")
-    if not raw:
-        raise ValueError("Upload or paste a private key first.")
-
-    password = str(passphrase or "").encode("utf-8") or None
-    try:
-        return serialization.load_pem_private_key(raw, password=password)
-    except TypeError as exc:
-        if password:
-            raise ValueError("Private key passphrase is incorrect.") from exc
-        raise ValueError("This private key is encrypted. Enter its passphrase.") from exc
-    except ValueError as exc:
-        raise ValueError("Invalid private key. Upload or paste a valid PEM private key.") from exc
-
-
-def _key_login_status(doc: dict, now: datetime | None = None) -> str:
-    now = now or _qr_login_now()
-    expires_at = _as_utc_naive(doc.get("expires_at"))
-    uses = int(doc.get("uses", 0) or 0)
-    max_uses = max(int(doc.get("max_uses", 0) or 0), 0)
-
-    if doc.get("revoked_at"):
-        return "Revoked"
-    if expires_at and expires_at <= now:
-        return "Expired"
-    if max_uses and uses >= max_uses:
-        return "Used"
-    return "Active"
-
-
-def create_encrypted_key_login(for_user: str, valid_days: int, max_uses: int = 0, note: str = "") -> tuple[bytes, dict]:
-    if not _crypto_available():
-        raise RuntimeError("Install cryptography to generate encrypted key logins.")
-
-    for_user = _clean_key_label(for_user)
-    if not for_user:
-        raise ValueError("Enter who this encrypted key is for.")
-
-    valid_days = max(1, min(int(valid_days or _KEY_DEFAULT_DAYS), _KEY_MAX_DAYS))
-    max_uses = max(0, min(int(max_uses or 0), 1000))
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    public_key_hash = _private_key_public_hash(private_key)
-    now = _qr_login_now()
-    doc = {
-        "public_key_hash": public_key_hash,
-        "fingerprint": _format_key_fingerprint(public_key_hash),
-        "for_user": for_user,
-        "created_by": st.session_state.get("username", "Admin"),
-        "created_at": now,
-        "expires_at": now + timedelta(days=valid_days),
-        "uses": 0,
-        "max_uses": max_uses,
-        "note": str(note or "").strip()[:200],
-    }
-    result = _key_login_collection().insert_one(doc.copy())
-    doc["_id"] = result.inserted_id
-    return private_pem, doc
-
-
-def consume_encrypted_key_login(pem_text: str, passphrase: str = "") -> tuple[bool, str, dict | None]:
-    try:
-        private_key = _load_private_key_from_pem(pem_text, passphrase=passphrase)
-    except Exception as exc:
-        return False, str(exc), None
-
-    public_key_hash = _private_key_public_hash(private_key)
-    doc = _key_login_collection().find_one({"public_key_hash": public_key_hash})
-    if not doc:
-        return False, "Encrypted key was not found. Generate or register a valid key first.", None
-
-    status = _key_login_status(doc)
-    if status == "Revoked":
-        return False, "This encrypted key has been revoked.", None
-    if status == "Expired":
-        return False, "This encrypted key has expired. Generate a fresh key.", None
-    if status == "Used":
-        return False, "This encrypted key has reached its allowed login limit.", None
-
-    uses = int(doc.get("uses", 0) or 0)
-    now = _qr_login_now()
-    query = {
-        "_id": doc["_id"],
-        "public_key_hash": public_key_hash,
-        "uses": uses,
-        "expires_at": {"$gt": now},
-        "$or": [{"revoked_at": {"$exists": False}}, {"revoked_at": None}],
-    }
-
-    result = _key_login_collection().update_one(
-        query,
-        {
-            "$inc": {"uses": 1},
-            "$set": {
-                "last_used_at": now,
-                "last_used_by": _clean_key_label(doc.get("for_user")) or "Key User",
-            },
-        },
-    )
-    if result.modified_count != 1:
-        return False, "This encrypted key is no longer valid. Generate a fresh key.", None
-
-    doc["uses"] = uses + 1
-    doc["last_used_at"] = now
-    return True, "Encrypted key accepted.", doc
-
-
-def _complete_key_login(doc: dict):
-    username = _clean_key_label(doc.get("for_user")) or "Key User"
-    st.session_state.logged_in = True
-    st.session_state.username = username
-    st.session_state.auth_method = "encrypted_key"
-    st.session_state.login_attempts = 0
-    st.session_state.login_lock_until = 0
-
-
-def _process_key_login(pem_text: str, passphrase: str = "") -> bool:
-    ok, message, doc = consume_encrypted_key_login(pem_text, passphrase=passphrase)
-    if ok and doc:
-        _complete_key_login(doc)
-        st.session_state.key_login_success = f"Signed in with encrypted key as {doc.get('for_user', 'Key User')}."
-        st.rerun()
-        return True
-    st.error(message)
-    return False
-
-
-def get_encrypted_key_docs(limit: int = 50) -> list[dict]:
-    try:
-        return list(_key_login_collection().find({}, {"public_key_hash": 0}).sort("created_at", -1).limit(limit))
-    except Exception:
-        return []
-
-
 # =====================================================
 # ADMIN LOGIN
 # =====================================================
 
+def _clear_pending_qr_login():
+    for key in ("pending_qr_payload", "pending_qr_member", "pending_qr_token_id", "pending_qr_pin_ok"):
+        st.session_state.pop(key, None)
+
+def _render_qr_member_login_panel():
+    if st.session_state.get("pending_qr_payload"):
+        member_name = st.session_state.get("pending_qr_member", "Member")
+        st.success(f"QR accepted for {member_name}.")
+        with st.form("qr_pin_form"):
+            pin = st.text_input("PIN", type="password", key="qr_login_pin")
+            submitted = st.form_submit_button("Verify PIN", width="stretch")
+        if submitted:
+            doc, error = _verify_temp_qr_pin(st.session_state.pending_qr_payload, pin)
+            if error:
+                st.error(error)
+            else:
+                member_name = doc.get("member_name", member_name)
+                _mark_temp_qr_used(doc["_id"])
+                _clear_pending_qr_login()
+                establish_login(member_name, role="member", method="qr_pin", qr_token_id=doc["_id"])
+                st.rerun()
+        if st.button("Scan different QR", key="scan_different_qr"):
+            _clear_pending_qr_login()
+            st.rerun()
+        return
+
+    st.caption("Paste the QR payload from the generated temporary QR invite.")
+    payload_text = st.text_area(
+        "QR Payload",
+        placeholder='{"type":"boutique_temp_login","token_id":"...","secret":"..."}',
+        height=130,
+        key="qr_login_payload_text",
+    )
+    if st.button("Use QR Payload", key="use_qr_payload", width="stretch"):
+        try:
+            payload = json.loads(payload_text.strip())
+        except Exception:
+            st.error("Paste a valid QR payload first.")
+            return
+        if payload.get("type") != _TEMP_QR_TYPE:
+            st.error("This QR payload is not a boutique login QR.")
+            return
+        doc, error = _lookup_temp_qr(payload)
+        if error:
+            st.error(error)
+            return
+        st.session_state.pending_qr_payload = payload
+        st.session_state.pending_qr_member = doc.get("member_name", "Member")
+        st.session_state.pending_qr_token_id = doc["_id"]
+        st.rerun()
+
+def _render_encrypted_key_login_panel():
+    st.caption("Upload or paste a registered PEM private key.")
+    key_upload = st.file_uploader("Upload Private Key", type=["pem", "key", "txt"], key="login_key_upload")
+    pasted_key = st.text_area(
+        "Paste Private Key",
+        placeholder="-----BEGIN RSA PRIVATE KEY-----",
+        height=180,
+        key="login_key_paste",
+    )
+    key_passphrase = st.text_input("Private Key Passphrase", type="password", placeholder="Optional", key="login_key_passphrase")
+    if st.button("Sign in with encrypted key", key="login_key_submit", width="stretch"):
+        key_text = ""
+        if key_upload is not None:
+            try:
+                key_text = key_upload.getvalue().decode("utf-8")
+            except UnicodeDecodeError:
+                st.error("Private key file must be a text PEM file.")
+                return
+        if not key_text:
+            key_text = pasted_key
+        ok, message, doc = consume_encrypted_key_login(key_text, passphrase=key_passphrase)
+        if ok and doc:
+            establish_login(
+                doc.get("for_user", "Key User"),
+                role=doc.get("role", "member"),
+                method="encrypted_key",
+            )
+            st.success(message)
+            st.rerun()
+        else:
+            st.error(message)
+
+def _render_password_fallback_panel():
+    if _get_username() is None:
+        st.info("Password fallback username is not configured.")
+        return
+
+    attempts_left = _MAX_ATTEMPTS - st.session_state.get("login_attempts", 0)
+    if attempts_left < _MAX_ATTEMPTS:
+        st.warning(f"{attempts_left} attempt(s) remaining before lockout.")
+
+    with st.form("admin_login_form"):
+        u = st.text_input("Username", placeholder="username", key="admin_u")
+        p = st.text_input("Password", type="password", placeholder="••••••••", key="admin_p")
+        submitted = st.form_submit_button("Sign in with password", width="stretch")
+
+    if submitted:
+        if _verify_credentials(u, p):
+            st.session_state.login_attempts = 0
+            st.session_state.login_lock_until = 0
+            establish_login(u, role="admin", method="password")
+            st.rerun()
+        else:
+            _record_failure()
+            locked2, secs_left2 = _check_lockout()
+            if locked2:
+                st.error(f"Account locked for {secs_left2 // 60}m {secs_left2 % 60}s.")
+            else:
+                st.error("Invalid credentials.")
+
 def render_admin_login_strip():
     st.markdown("<div class='admin-strip'>", unsafe_allow_html=True)
-    st.markdown("<div class='admin-strip-label'>◆ Admin Access</div>", unsafe_allow_html=True)
+    st.markdown("<div class='admin-strip-label'>◆ Secure Access</div>", unsafe_allow_html=True)
 
     with st.expander("Sign in to Admin Dashboard", expanded=False):
-        qr_error = st.session_state.pop("qr_login_error", None)
-        qr_success = st.session_state.pop("qr_login_success", None)
-        key_error = st.session_state.pop("key_login_error", None)
-        key_success = st.session_state.pop("key_login_success", None)
-        if qr_error:
-            st.error(qr_error)
-        if qr_success:
-            st.success(qr_success)
-        if key_error:
-            st.error(key_error)
-        if key_success:
-            st.success(key_success)
+        locked, secs_left = _check_lockout()
+        if locked:
+            st.error(f"Too many failed attempts. Try again in {secs_left // 60}m {secs_left % 60}s.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
 
-        key_tab, password_tab, qr_tab = st.tabs(["Encrypted Key", "Password", "Scan QR Code"])
-
-        with password_tab:
-            # Credential config check for password login only. QR logins stay available.
-            if _get_stored_hash() is None or _get_username() is None:
-                st.error(
-                    "Admin credentials are not configured. "
-                    "Set USERNAME and PASSWORD (or PASSWORD_HASH) in st.secrets or environment variables."
-                )
-            else:
-                locked, secs_left = _check_lockout()
-                if locked:
-                    st.error(f"Too many failed attempts. Try again in {secs_left // 60}m {secs_left % 60}s.")
-                else:
-                    attempts_left = _MAX_ATTEMPTS - st.session_state.get("login_attempts", 0)
-                    if attempts_left < _MAX_ATTEMPTS:
-                        st.warning(f"{attempts_left} attempt(s) remaining before lockout.")
-
-                    with st.form("admin_login_form"):
-                        u = st.text_input("Username", placeholder="username",   key="admin_u")
-                        p = st.text_input("Password", type="password",
-                                          placeholder="••••••••",                key="admin_p")
-                        submitted = st.form_submit_button("Sign In", use_container_width=True)
-
-                    if submitted:
-                        if _verify_credentials(u, p):
-                            st.session_state.logged_in      = True
-                            st.session_state.username        = u
-                            st.session_state.auth_method     = "password"
-                            st.session_state.login_attempts  = 0
-                            st.session_state.login_lock_until = 0
-                            st.rerun()
-                        else:
-                            _record_failure()
-                            locked2, secs_left2 = _check_lockout()
-                            if locked2:
-                                st.error(f"Account locked for {secs_left2 // 60}m {secs_left2 % 60}s.")
-                            else:
-                                st.error("Invalid credentials.")
-
-        with qr_tab:
-            st.caption("Scan a secure QR code generated from Manage Logins & QR Code.")
-            camera_qr = st.camera_input("Scan QR Code", key="login_qr_camera")
-            uploaded_qr = st.file_uploader(
-                "Or upload a QR image",
-                type=["png", "jpg", "jpeg"],
-                key="login_qr_upload",
-            )
-            scanned_qr = camera_qr or uploaded_qr
-            if scanned_qr:
-                payload, decode_error = _decode_qr_image(scanned_qr)
-                if decode_error:
-                    st.warning(decode_error)
-                else:
-                    _process_qr_login_payload(payload)
-
-            manual_qr = st.text_input(
-                "Paste QR token",
-                type="password",
-                placeholder="Use this only if scanning is not available",
-                key="login_qr_manual_token",
-            )
-            if st.button("Sign In With QR Code", key="login_qr_manual_submit", use_container_width=True):
-                if manual_qr.strip():
-                    _process_qr_login_payload(manual_qr.strip())
-                else:
-                    st.error("Scan a QR code or paste its token first.")
-
+        key_tab, password_tab, qr_tab = st.tabs(["Encrypted Key", "Password fallback", "QR member"])
         with key_tab:
-            st.caption("Upload or paste a registered PEM private key.")
-            if not _crypto_available():
-                st.warning("Encrypted key login requires the cryptography package.")
-
-            key_upload = st.file_uploader(
-                "Upload Private Key",
-                type=["pem", "key", "txt"],
-                key="login_key_upload",
-            )
-            pasted_key = st.text_area(
-                "Paste Private Key",
-                placeholder="-----BEGIN RSA PRIVATE KEY-----",
-                height=180,
-                key="login_key_paste",
-            )
-            key_passphrase = st.text_input(
-                "Private Key Passphrase",
-                type="password",
-                placeholder="Optional",
-                key="login_key_passphrase",
-            )
-            if st.button("Sign In With Encrypted Key", key="login_key_submit", use_container_width=True):
-                key_text = ""
-                if key_upload is not None:
-                    try:
-                        key_text = key_upload.getvalue().decode("utf-8")
-                    except UnicodeDecodeError:
-                        st.error("Private key file must be a text PEM file.")
-                if not key_text:
-                    key_text = pasted_key
-
-                if key_text.strip():
-                    _process_key_login(key_text, passphrase=key_passphrase)
-                else:
-                    st.error("Upload or paste your private key first.")
+            _render_encrypted_key_login_panel()
+        with password_tab:
+            _render_password_fallback_panel()
+        with qr_tab:
+            _render_qr_member_login_panel()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2754,10 +3851,6 @@ def sidebar():
         """, unsafe_allow_html=True)
         st.markdown("<div class='sb-sep'></div>", unsafe_allow_html=True)
 
-        render_passbook_sidebar()
-
-        st.markdown("<div class='sb-sep'></div>", unsafe_allow_html=True)
-
         df = fetch_all()
         m  = metrics(df)
 
@@ -2769,23 +3862,38 @@ def sidebar():
 
         st.markdown("<div class='sb-sep'></div>", unsafe_allow_html=True)
 
-        nav = st.radio("Navigation", [
-            "Dashboard",
-            "Add Sale",
-            "Review Accounts",
-            "Update Transaction",
-            "Customer List",
-            "Analytics",
-            "Reminders & Alerts",
-            "Generate Bill",
-            "Manage Logins & QR Code",
-            "Backup & Restore",
-            "Logout",
-        ], label_visibility="collapsed")
+        if _is_admin():
+            nav_options = [
+                "Dashboard",
+                "Add Sale",
+                "Review Accounts",
+                "Update Transaction",
+                "Customer List",
+                "Analytics",
+                "Reminders & Alerts",
+                "Generate Bill",
+                "Passbook Reader",
+                "Work Notes",
+                "AI Assistant",
+                "Security & Devices",
+                "Backup & Restore",
+                "Logout",
+            ]
+        else:
+            nav_options = [
+                "Add Sale",
+                "Review Accounts",
+                "Customer List",
+                "Generate Bill",
+                "Logout",
+            ]
+
+        nav = st.radio("Navigation", nav_options, label_visibility="collapsed")
 
         st.markdown("<div class='sb-sep'></div>", unsafe_allow_html=True)
+        role_label = st.session_state.get("user_role", "admin").title()
         st.markdown(
-            f"<div class='sb-user'>◆ {st.session_state.get('username','Admin').title()}</div>",
+            f"<div class='sb-user'>◆ {st.session_state.get('username','Admin').title()} · {role_label}</div>",
             unsafe_allow_html=True,
         )
     return nav
@@ -2794,247 +3902,208 @@ def sidebar():
 # ADMIN PAGES
 # =====================================================
 
-def page_manage_logins():
-    page_header("Manage Logins", "Secure QR & Encrypted Key Access")
-    st.info(
-        "QR logins use high-entropy random tokens. Encrypted key logins use RSA PEM private keys. "
-        "Only hashes/fingerprints are stored in MongoDB, and access can expire or be revoked."
-    )
+def _format_auth_dt(value) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    if value:
+        return str(value)[:16]
+    return "Never"
 
-    expiry_options = {
-        "15 minutes": 15,
-        "30 minutes": 30,
-        "1 hour": 60,
-        "4 hours": 240,
-        "1 day": 1440,
-        "7 days": 10080,
-    }
+def page_security_devices():
+    if not _is_admin():
+        st.error("Security settings are available only to admins.")
+        return
 
-    left, right = st.columns([1.05, 0.95])
-    with left:
-        sec("Generate QR Login")
-        with st.form("qr_login_generate_form"):
-            for_user = st.text_input("For Whom", placeholder="Staff or person name")
-            valid_label = st.selectbox("Valid For", list(expiry_options.keys()), index=0)
-            max_uses = st.number_input("Allowed Scans", min_value=1, max_value=20, value=1, step=1)
-            app_url = st.text_input(
-                "App Login URL",
-                placeholder="Optional: https://your-streamlit-app-url",
-                help="Optional. If added, scanning the QR with a phone opens the app with the secure login token.",
-            )
-            note = st.text_input("Purpose / Device Note", placeholder="Optional")
-            submitted = st.form_submit_button("Generate Secure QR Code", use_container_width=True)
+    ensure_auth_indexes()
+    page_header("Security & Devices", "Encrypted Keys, QR Invites & Login Sessions")
+    key_tab, qr_tab, device_tab = st.tabs(["Encrypted Keys", "Temporary QR", "Login devices"])
 
-        if submitted:
-            try:
-                token, doc = create_qr_login(
-                    for_user=for_user,
-                    valid_minutes=expiry_options[valid_label],
-                    max_uses=int(max_uses),
-                    note=note,
-                    app_url=app_url,
-                )
-                payload = _build_qr_payload(token, app_url)
-                st.session_state.last_qr_login = {
-                    "token": token,
-                    "payload": payload,
-                    "for_user": doc["for_user"],
-                    "expires_at": doc["expires_at"].isoformat(),
-                    "max_uses": doc["max_uses"],
-                }
-                st.success(f"QR login generated for {doc['for_user']}.")
-            except Exception as exc:
-                st.error(str(exc))
-
-    with right:
-        sec("Latest QR Code")
-        latest = st.session_state.get("last_qr_login")
-        if latest:
-            try:
-                qr_png = _qr_png_bytes(latest["payload"])
-                png_bytes = qr_png.getvalue()
-                st.image(png_bytes, width=280, caption=f"For {latest['for_user']}")
-                safe_subject = re.sub(r"[^0-9A-Za-z]+", "_", latest["for_user"]).strip("_").lower() or "qr_login"
-                st.download_button(
-                    "Download QR PNG",
-                    data=png_bytes,
-                    file_name=f"{safe_subject}_qr_login.png",
-                    mime="image/png",
-                    use_container_width=True,
-                )
-                st.caption(
-                    f"Expires: {_format_qr_dt(latest.get('expires_at'))} | "
-                    f"Allowed scans: {latest.get('max_uses', 1)}"
-                )
-                with st.expander("Emergency copy token", expanded=False):
-                    st.code(latest["token"])
-            except Exception as exc:
-                st.error(str(exc))
-        else:
-            st.markdown(
-                "<div class='empty'><div class='empty-glyph'>◆</div><div>No QR code generated in this session.</div></div>",
-                unsafe_allow_html=True,
-            )
-
-    rule()
-    sec("Active QR Logins")
-    docs = get_qr_login_docs(limit=100)
-    active_docs = [doc for doc in docs if _qr_login_status(doc) == "Active"]
-    if active_docs:
-        labels = {}
-        for doc in active_docs:
-            scans = f"{int(doc.get('uses', 0) or 0)}/{int(doc.get('max_uses', 1) or 1)}"
-            short_id = str(doc.get("_id", ""))[-6:]
-            label = f"{doc.get('for_user', 'QR User')} | expires {_format_qr_dt(doc.get('expires_at'))} | scans {scans} | {short_id}"
-            labels[label] = doc
-        selected_label = st.selectbox("Select QR Login To Revoke", list(labels.keys()))
-        if st.button("Revoke Selected QR Login", use_container_width=True):
-            selected_doc = labels[selected_label]
-            _qr_login_collection().update_one(
-                {"_id": selected_doc["_id"]},
-                {"$set": {
-                    "revoked_at": _qr_login_now(),
-                    "revoked_by": st.session_state.get("username", "Admin"),
-                }},
-            )
-            st.success("QR login revoked.")
-            st.rerun()
-    else:
-        st.caption("No active QR logins right now.")
-
-    sec("Recent QR Login Activity")
-    if not docs:
-        st.markdown("<div class='empty'><div class='empty-glyph'>◆</div><div>No QR login records yet.</div></div>", unsafe_allow_html=True)
-    else:
-        rows = []
-        for doc in docs:
-            uses = int(doc.get("uses", 0) or 0)
-            max_uses = int(doc.get("max_uses", 1) or 1)
-            rows.append({
-                "For Whom": doc.get("for_user", "QR User"),
-                "Status": _qr_login_status(doc),
-                "Scans": f"{uses}/{max_uses}",
-                "Expires": _format_qr_dt(doc.get("expires_at")),
-                "Created By": doc.get("created_by", "Admin"),
-                "Created": _format_qr_dt(doc.get("created_at")),
-                "Last Used": _format_qr_dt(doc.get("last_used_at")),
-                "Note": doc.get("note", ""),
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    rule()
-    sec("Generate Encrypted Key")
-    if not _crypto_available():
-        st.warning("Install cryptography to generate and use encrypted key logins.")
-    else:
-        k_left, k_right = st.columns([1.05, 0.95])
-        with k_left:
-            with st.form("encrypted_key_generate_form"):
-                key_user = st.text_input("Key For Whom", placeholder="Staff or device name")
-                key_valid_days = st.number_input(
-                    "Valid Days",
-                    min_value=1,
-                    max_value=_KEY_MAX_DAYS,
-                    value=_KEY_DEFAULT_DAYS,
-                    step=1,
-                )
-                key_max_uses = st.number_input(
-                    "Allowed Logins",
-                    min_value=0,
-                    max_value=1000,
-                    value=0,
-                    step=1,
-                    help="Use 0 for unlimited logins until expiry or revocation.",
-                )
-                key_note = st.text_input("Key Note", placeholder="Optional")
-                key_submitted = st.form_submit_button("Generate Encrypted Key", use_container_width=True)
-
+    with key_tab:
+        with st.container(border=True):
+            st.subheader("Generate encrypted key")
+            with st.form("generate_encrypted_key_form"):
+                key_name = st.text_input("Key for whom", value=st.session_state.get("username", "Admin"), key="security_key_name")
+                key_role = st.selectbox("Access role", ["admin", "member"], format_func=lambda item: item.title(), key="security_key_role")
+                key_days = st.number_input("Valid days", min_value=1, max_value=_KEY_MAX_DAYS, value=_KEY_DEFAULT_DAYS, step=1)
+                key_max_uses = st.number_input("Allowed logins", min_value=0, max_value=1000, value=0, step=1, help="Use 0 for unlimited logins until expiry or revocation.")
+                key_note = st.text_input("Key note", placeholder="Optional", key="security_key_note")
+                key_submitted = st.form_submit_button("Generate encrypted key", width="stretch")
             if key_submitted:
                 try:
-                    private_pem, key_doc = create_encrypted_key_login(
-                        for_user=key_user,
-                        valid_days=int(key_valid_days),
-                        max_uses=int(key_max_uses),
-                        note=key_note,
-                    )
-                    safe_subject = re.sub(r"[^0-9A-Za-z]+", "_", key_doc["for_user"]).strip("_").lower() or "encrypted_key"
-                    st.session_state.last_encrypted_key = {
+                    private_pem, key_doc = create_encrypted_key_login(key_name, key_role, int(key_days), int(key_max_uses), key_note)
+                    safe_name = re.sub(r"[^0-9A-Za-z]+", "_", key_doc["for_user"]).strip("_").lower() or "encrypted_key"
+                    st.session_state.generated_encrypted_key = {
                         "private_pem": private_pem.decode("utf-8"),
-                        "for_user": key_doc["for_user"],
+                        "file_name": f"{safe_name}_encrypted_key.pem",
                         "fingerprint": key_doc["fingerprint"],
-                        "expires_at": key_doc["expires_at"].isoformat(),
-                        "file_name": f"{safe_subject}_encrypted_key.pem",
+                        "expires_at": key_doc["expires_at"],
                     }
                     st.success(f"Encrypted key generated for {key_doc['for_user']}.")
                 except Exception as exc:
                     st.error(str(exc))
 
-        with k_right:
-            latest_key = st.session_state.get("last_encrypted_key")
-            if latest_key:
-                pem_text = latest_key["private_pem"]
-                st.caption(f"Fingerprint: {latest_key['fingerprint']}")
-                st.caption(f"Expires: {_format_qr_dt(latest_key.get('expires_at'))}")
+            generated_key = st.session_state.get("generated_encrypted_key")
+            if generated_key:
+                st.caption(f"Fingerprint: {generated_key['fingerprint']}")
+                st.caption(f"Expires: {_format_auth_dt(generated_key['expires_at'])}")
                 st.download_button(
-                    "Download Private Key PEM",
-                    data=pem_text.encode("utf-8"),
-                    file_name=latest_key["file_name"],
+                    "Download private key PEM",
+                    data=generated_key["private_pem"].encode("utf-8"),
+                    file_name=generated_key["file_name"],
                     mime="application/x-pem-file",
-                    use_container_width=True,
+                    width="content",
                 )
                 with st.expander("Emergency copy private key", expanded=False):
-                    st.code(pem_text)
-            else:
-                st.markdown(
-                    "<div class='empty'><div class='empty-glyph'>◆</div><div>No encrypted key generated in this session.</div></div>",
-                    unsafe_allow_html=True,
+                    st.code(generated_key["private_pem"])
+
+        st.markdown("<div class='rule-sm'></div>", unsafe_allow_html=True)
+        keys = list(auth_keys_collection().find({}, {"public_key_hash": 0}).sort("created_at", -1).limit(100))
+        if not keys:
+            st.info("No encrypted keys created yet.")
+        for key_doc in keys:
+            key_id = key_doc["_id"]
+            status = _encrypted_key_status(key_doc)
+            max_uses = int(key_doc.get("max_uses", 0) or 0)
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([2.2, 1.1, 1.6, 0.9])
+                c1.markdown(f"**{html_escape(str(key_doc.get('for_user', 'Key User')))}**")
+                c1.caption(str(key_doc.get("fingerprint", "-")))
+                c2.write(str(key_doc.get("role", "member")).title())
+                c2.caption(status)
+                c3.write(f"Expires: {_format_auth_dt(key_doc.get('expires_at'))}")
+                c3.caption(f"Logins: {int(key_doc.get('uses', 0) or 0)}/{max_uses if max_uses else 'unlimited'}")
+                if status == "Active":
+                    if c4.button("Revoke", key=f"revoke_key_{key_id}", width="stretch"):
+                        auth_keys_collection().update_one(
+                            {"_id": key_id},
+                            {"$set": {
+                                "active": False,
+                                "revoked_at": datetime.now(),
+                                "revoked_by": st.session_state.get("username", "Admin"),
+                            }},
+                        )
+                        st.success("Encrypted key revoked.")
+                        st.rerun()
+                else:
+                    if c4.button("Delete", key=f"delete_key_{key_id}", width="stretch"):
+                        auth_keys_collection().delete_one({"_id": key_id})
+                        st.success("Encrypted key deleted.")
+                        st.rerun()
+
+    with qr_tab:
+        with st.container(border=True):
+            st.subheader("Generate temporary QR")
+            with st.form("generate_temp_qr_form"):
+                member_name = st.text_input("Member name", key="qr_member_name")
+                pin = st.text_input("PIN to share", type="password", key="qr_member_pin")
+                pin2 = st.text_input("Confirm PIN", type="password", key="qr_member_pin2")
+                expires_hours = st.number_input("Expires in hours", min_value=1, max_value=168, value=24, step=1)
+                submitted = st.form_submit_button("Generate QR", width="stretch")
+            if submitted:
+                if not member_name.strip():
+                    st.error("Enter the member name.")
+                elif len(pin) < 4:
+                    st.error("Use at least 4 characters for the PIN.")
+                elif pin != pin2:
+                    st.error("PIN values do not match.")
+                else:
+                    st.session_state.generated_temp_qr = create_temp_qr_invite(member_name, pin, int(expires_hours))
+                    st.success("Temporary QR generated.")
+
+            generated = st.session_state.get("generated_temp_qr")
+            if generated:
+                st.image(generated["qr_png"], width=260)
+                st.caption(f"For {generated['member_name']} · expires {_format_auth_dt(generated['expires_at'])}")
+                st.download_button(
+                    "Download QR",
+                    data=generated["qr_png"],
+                    file_name=f"{generated['member_name'].replace(' ', '_')}_login_qr.png",
+                    mime="image/png",
+                    width="content",
                 )
+                with st.expander("Copy QR payload for login", expanded=False):
+                    st.code(generated["payload_json"])
 
-    sec("Active Encrypted Keys")
-    key_docs = get_encrypted_key_docs(limit=100)
-    active_key_docs = [doc for doc in key_docs if _key_login_status(doc) == "Active"]
-    if active_key_docs:
-        key_labels = {}
-        for doc in active_key_docs:
-            max_uses = int(doc.get("max_uses", 0) or 0)
-            scans = f"{int(doc.get('uses', 0) or 0)}/{max_uses if max_uses else '∞'}"
-            label = f"{doc.get('for_user', 'Key User')} | {doc.get('fingerprint', '-')} | expires {_format_qr_dt(doc.get('expires_at'))} | logins {scans}"
-            key_labels[label] = doc
-        selected_key_label = st.selectbox("Select Encrypted Key To Revoke", list(key_labels.keys()))
-        if st.button("Revoke Selected Encrypted Key", use_container_width=True):
-            selected_doc = key_labels[selected_key_label]
-            _key_login_collection().update_one(
-                {"_id": selected_doc["_id"]},
-                {"$set": {
-                    "revoked_at": _qr_login_now(),
-                    "revoked_by": st.session_state.get("username", "Admin"),
-                }},
-            )
-            st.success("Encrypted key revoked.")
-            st.rerun()
-    else:
-        st.caption("No active encrypted keys right now.")
+        st.markdown("<div class='rule-sm'></div>", unsafe_allow_html=True)
+        invites = list(auth_qr_collection().find(
+            {},
+            {"secret_hash": 0, "pin_hash": 0},
+        ).sort("created_at", -1).limit(50))
+        if not invites:
+            st.info("No QR invites created yet.")
+        for invite in invites:
+            invite_id = invite["_id"]
+            active = bool(invite.get("active", True)) and not invite.get("used_at")
+            if isinstance(invite.get("expires_at"), datetime) and invite["expires_at"] < datetime.now():
+                active = False
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([2.2, 1.1, 1.4, 0.9])
+                c1.markdown(f"**{html_escape(str(invite.get('member_name', 'Member')))}**")
+                c1.caption(f"Created {_format_auth_dt(invite.get('created_at'))}")
+                c2.write("Active" if active else "Closed")
+                c3.write(f"Expires: {_format_auth_dt(invite.get('expires_at'))}")
+                if invite.get("used_at"):
+                    c3.caption(f"Used {_format_auth_dt(invite.get('used_at'))}")
+                elif active and c4.button("Revoke", key=f"revoke_qr_{invite_id}", width="stretch"):
+                    auth_qr_collection().update_one(
+                        {"_id": invite_id},
+                        {"$set": {
+                            "active": False,
+                            "revoked_at": datetime.now(),
+                            "revoked_by": st.session_state.get("username", "Admin"),
+                        }},
+                    )
+                    st.success("QR invite revoked.")
+                    st.rerun()
 
-    sec("Recent Encrypted Key Activity")
-    if not key_docs:
-        st.markdown("<div class='empty'><div class='empty-glyph'>◆</div><div>No encrypted key records yet.</div></div>", unsafe_allow_html=True)
-    else:
-        key_rows = []
-        for doc in key_docs:
-            max_uses = int(doc.get("max_uses", 0) or 0)
-            key_rows.append({
-                "For Whom": doc.get("for_user", "Key User"),
-                "Status": _key_login_status(doc),
-                "Fingerprint": doc.get("fingerprint", "-"),
-                "Logins": f"{int(doc.get('uses', 0) or 0)}/{max_uses if max_uses else '∞'}",
-                "Expires": _format_qr_dt(doc.get("expires_at")),
-                "Created By": doc.get("created_by", "Admin"),
-                "Created": _format_qr_dt(doc.get("created_at")),
-                "Last Used": _format_qr_dt(doc.get("last_used_at")),
-                "Note": doc.get("note", ""),
-            })
-        st.dataframe(pd.DataFrame(key_rows), use_container_width=True, hide_index=True)
+    with device_tab:
+        devices = list(auth_devices_collection().find({}).sort("last_login_at", -1).limit(100))
+        if not devices:
+            st.info("No login devices recorded yet.")
+        for device in devices:
+            device_id = device["_id"]
+            current = device_id == st.session_state.get("auth_device_id")
+            active = bool(device.get("active", True))
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([2.2, 1.1, 1.6, 0.9])
+                label = device.get("label") or "Browser session"
+                c1.markdown(f"**{html_escape(str(label))}**")
+                c1.caption("This session" if current else str(device.get("signature", "")))
+                c2.write(str(device.get("role", "member")).title())
+                c2.caption(str(device.get("method", "login")).replace("_", " ").title())
+                c3.write(str(device.get("user_name", "Member")))
+                c3.caption(f"Last login {_format_auth_dt(device.get('last_login_at'))}")
+                if active:
+                    if c4.button("Revoke", key=f"revoke_device_{device_id}", width="stretch"):
+                        auth_devices_collection().update_one(
+                            {"_id": device_id},
+                            {"$set": {
+                                "active": False,
+                                "revoked_at": datetime.now(),
+                                "revoked_by": st.session_state.get("username", "Admin"),
+                            }},
+                        )
+                        if current:
+                            _clear_auth_state()
+                        st.success("Login device revoked.")
+                        st.rerun()
+                else:
+                    if c4.button("Delete", key=f"delete_device_{device_id}", width="stretch"):
+                        auth_devices_collection().delete_one({"_id": device_id})
+                        st.success("Login device deleted.")
+                        st.rerun()
 
+    security_context = "\n\n".join([
+        "Encrypted keys:\n" + df_for_ai(pd.DataFrame(keys).drop(columns=["public_key_hash"], errors="ignore") if "keys" in locals() and keys else pd.DataFrame(), limit=60),
+        "Temporary QR invites:\n" + df_for_ai(pd.DataFrame(list(auth_qr_collection().find({}, {"secret_hash": 0, "pin_hash": 0}).sort("created_at", -1).limit(60))), limit=60),
+        "Login devices:\n" + df_for_ai(pd.DataFrame(list(auth_devices_collection().find({}, {"user_agent": 0}).sort("last_login_at", -1).limit(60))), limit=60),
+    ])
+    render_ai_panel(
+        "AI Security Review",
+        security_context,
+        "security_ai",
+        "Review login security. Flag risky active keys, stale devices, expired QR invites, and suggest what to revoke or rotate.",
+    )
 
 def page_dashboard():
     page_header("Dashboard", "Business Overview")
@@ -3064,7 +4133,7 @@ def page_dashboard():
         fig.add_trace(go.Bar(x=monthly["month"], y=monthly["revenue"], name="Revenue", marker_color="rgba(46,111,216,0.4)", marker_line_color="#2E6FD8", marker_line_width=1))
         fig.add_trace(go.Scatter(x=monthly["month"], y=monthly["profit"], name="Profit", mode="lines+markers", line=dict(color="#7ADFA0", width=2), marker=dict(size=5, color="#7ADFA0")))
         styled_fig(fig, 300).update_layout(title="Monthly Revenue & Profit", barmode="overlay", legend=dict(orientation="h", y=1.18, x=0))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with cr:
         paid    = (df["payment_received"] == 1).sum()
@@ -3073,13 +4142,13 @@ def page_dashboard():
         fig2.add_annotation(text=f"<b>{paid+pending}</b>", x=0.5, y=0.52, showarrow=False, font=dict(color="#E8EEF8", family="Playfair Display", size=28))
         fig2.add_annotation(text="sales", x=0.5, y=0.38, showarrow=False, font=dict(color="#3D5478", family="Jost", size=11))
         styled_fig(fig2, 300).update_layout(title="Payment Status", showlegend=True, legend=dict(orientation="h", y=-0.05, x=0.25))
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     cl2, cr2 = st.columns(2)
     with cl2:
         cat_rev = df.groupby("product_category")["selling_price"].sum().reset_index()
         fig3 = px.pie(cat_rev, values="selling_price", names="product_category", title="Revenue by Category", hole=0.55, color_discrete_sequence=["#2E6FD8","#4D8AE8","#7ADFA0","#8BACD8","#E08090","#1A3D80","#3D9A6C","#4A9AC8","#9B9070","#A8C4F0"])
-        styled_fig(fig3, 270); st.plotly_chart(fig3, use_container_width=True)
+        styled_fig(fig3, 270); st.plotly_chart(fig3, width="stretch")
 
     with cr2:
         daily = df.set_index("sale_date")["selling_price"].resample("D").sum().reset_index()
@@ -3089,7 +4158,7 @@ def page_dashboard():
         fig4.add_trace(go.Bar(x=daily["date"], y=daily["revenue"], name="Daily", marker_color="rgba(46,111,216,0.25)", marker_line_width=0))
         fig4.add_trace(go.Scatter(x=daily["date"], y=daily["rolling"], name="7-day avg", line=dict(color="#2E6FD8", width=1.8)))
         styled_fig(fig4, 270).update_layout(title="Daily Revenue", legend=dict(orientation="h", y=1.18, x=0))
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width="stretch")
 
     sec("Recent Transactions")
     recent = df.sort_values("sale_date", ascending=False).head(10).copy()
@@ -3098,14 +4167,21 @@ def page_dashboard():
     recent["Delayed"]   = recent["delay_status"].map({0:"—", 1:"Yes"})
     show = recent[["id","customer_name","sale_date","product_category","selling_price","profit","pending_amount","Status","Delayed"]].copy()
     show.columns = ["ID","Customer","Date","Category","Amount ₹","Profit ₹","Pending ₹","Status","Delayed"]
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    st.dataframe(show, width="stretch", hide_index=True)
 
     rule()
     da, db, _ = st.columns([1, 1, 2])
     with da:
-        st.download_button("Export CSV", data=df.assign(sale_date=df["sale_date"].astype(str)).to_csv(index=False), file_name=f"boutique_{date.today()}.csv", mime="text/csv", use_container_width=True)
+        st.download_button("Export CSV", data=df.assign(sale_date=df["sale_date"].astype(str)).to_csv(index=False), file_name=f"boutique_{date.today()}.csv", mime="text/csv", width="stretch")
     with db:
-        st.download_button("Export Excel", data=to_excel(df), file_name=f"boutique_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("Export Excel", data=to_excel(df), file_name=f"boutique_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+
+    render_ai_panel(
+        "AI Dashboard Summary",
+        build_ai_business_context(),
+        "dashboard_ai",
+        "Summarize the current business status, important risks, and the top 3 actions I should take next.",
+    )
 
 
 def page_review():
@@ -3181,7 +4257,7 @@ def page_review():
 
     edited_accounts = st.data_editor(
         editor,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="fixed",
         disabled=["ID", "Profit ₹", "Pending ₹", "Status"],
@@ -3203,7 +4279,7 @@ def page_review():
     )
     save_edit_col, _ = st.columns([1, 3])
     with save_edit_col:
-        if st.button("Save Edited Rows", use_container_width=True):
+        if st.button("Save Edited Rows", width="stretch"):
             changed, errors = save_account_editor_changes(fdf, edited_accounts)
             for err in errors:
                 st.error(err)
@@ -3215,9 +4291,16 @@ def page_review():
 
     dc, de, _ = st.columns([1,1,2])
     with dc:
-        st.download_button("Export CSV", data=fdf.assign(sale_date=fdf["sale_date"].astype(str)).to_csv(index=False), file_name=f"accounts_{date.today()}.csv", mime="text/csv", use_container_width=True)
+        st.download_button("Export CSV", data=fdf.assign(sale_date=fdf["sale_date"].astype(str)).to_csv(index=False), file_name=f"accounts_{date.today()}.csv", mime="text/csv", width="stretch")
     with de:
-        st.download_button("Export Excel", data=to_excel(fdf), file_name=f"accounts_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("Export Excel", data=to_excel(fdf), file_name=f"accounts_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+
+    render_ai_panel(
+        "AI Review Current Filter",
+        "Filtered account rows:\n" + df_for_ai(fdf, ["id","customer_name","customer_phone","sale_date","vendor","product_category","selling_price","amount_paid","pending_amount","payment_method"], 60),
+        "review_ai",
+        "Analyze these filtered rows. Call out pending collections, unusual entries, and practical follow-up actions.",
+    )
 
     sec("Mark Payments")
     pend = fdf[fdf["pending_amount"] > 0].sort_values("pending_amount", ascending=False)
@@ -3258,7 +4341,7 @@ def page_review():
             )
             action_cols = st.columns([4, 1])
             with action_cols[1]:
-                if st.button("Mark Paid", key=f"pay_open_{row_id}", use_container_width=True):
+                if st.button("Mark Paid", key=f"pay_open_{row_id}", width="stretch"):
                     st.session_state.payment_editor_id = row_id
                     st.rerun()
 
@@ -3276,9 +4359,9 @@ def page_review():
                         received_by = st.text_input("Received By", value=default_receiver_name(), key=f"payment_received_by_{row_id}")
                     save_col, cancel_col = st.columns(2)
                     with save_col:
-                        save_payment = st.form_submit_button("Save Payment", use_container_width=True)
+                        save_payment = st.form_submit_button("Save Payment", width="stretch")
                     with cancel_col:
-                        cancel_payment = st.form_submit_button("Cancel", use_container_width=True)
+                        cancel_payment = st.form_submit_button("Cancel", width="stretch")
 
                     if save_payment:
                         if not payment_ok:
@@ -3332,10 +4415,12 @@ def page_update():
     preview = df[preview_cols].copy()
     if "payment_received" in preview.columns:
         preview["payment_received"] = preview["payment_received"].map({0:"Pending",1:"Paid"})
-    st.dataframe(preview, use_container_width=True, hide_index=True)
+    st.dataframe(preview, width="stretch", hide_index=True)
 
     sel = st.selectbox("Select ID to Edit", df["id"].tolist(), format_func=lambda x: f"#{x} — {df[df['id']==x]['customer_name'].values[0]}")
     row = df[df["id"] == sel].iloc[0]
+    rule_sm()
+    render_ai_update_assistant(row, int(sel))
     rule_sm()
 
     with st.form("update_form"):
@@ -3375,8 +4460,8 @@ def page_update():
         m3.metric("Updated Margin",  f"{(nprofit/ns*100 if ns>0 else 0):.1f}%")
 
         bu, bd = st.columns(2)
-        with bu: upd = st.form_submit_button("Save Changes",       use_container_width=True)
-        with bd: dlt = st.form_submit_button("Delete Transaction",  use_container_width=True)
+        with bu: upd = st.form_submit_button("Save Changes",       width="stretch")
+        with bd: dlt = st.form_submit_button("Delete Transaction",  width="stretch")
 
         if upd:
             errs = []
@@ -3449,16 +4534,16 @@ def page_customers():
     if tier_f != "All": view = view[view["tier"] == tier_f]
 
     disp = view.rename(columns={"customer_name":"Customer","phone":"Phone","transactions":"Visits","spent":"Total Spent ₹","pending":"Pending ₹","last_visit":"Last Visit","profit":"Profit ₹","tier":"Tier"})
-    st.dataframe(disp.style.format({"Total Spent ₹":"₹{:,.0f}","Pending ₹":"₹{:,.0f}","Profit ₹":"₹{:,.0f}"}), use_container_width=True, hide_index=True)
+    st.dataframe(disp.style.format({"Total Spent ₹":"₹{:,.0f}","Pending ₹":"₹{:,.0f}","Profit ₹":"₹{:,.0f}"}), width="stretch", hide_index=True)
 
     dc, de = st.columns(2)
     with dc:
-        st.download_button("Export CSV", data=disp.to_csv(index=False), file_name=f"customers_{date.today()}.csv", mime="text/csv", use_container_width=True)
+        st.download_button("Export CSV", data=disp.to_csv(index=False), file_name=f"customers_{date.today()}.csv", mime="text/csv", width="stretch")
     with de:
         out = BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as w: disp.to_excel(w, index=False)
         out.seek(0)
-        st.download_button("Export Excel", data=out, file_name=f"customers_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("Export Excel", data=out, file_name=f"customers_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
 
     sec("Purchase History")
     chosen = st.selectbox("Select Customer", summ["customer_name"].tolist())
@@ -3474,13 +4559,19 @@ def page_customers():
         cols = [c for c in ["sale_date","product_category","product_description","selling_price","amount_paid","pending_amount","payment_method","status"] if c in hist.columns]
         show = hist[cols].copy()
         show.columns = ["Date","Category","Description","Price ₹","Paid ₹","Pending ₹","Method","Status"][:len(cols)]
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.dataframe(show, width="stretch", hide_index=True)
         if len(hist) > 1:
             hs = df[df["customer_name"]==chosen].sort_values("sale_date").copy()
             hs["cumulative"] = hs["selling_price"].cumsum()
             fig = px.line(hs, x="sale_date", y="cumulative", title=f"Cumulative Spend — {chosen}", markers=True)
             fig.update_traces(line_color="#2E6FD8", marker_color="#4D8AE8", marker_size=5)
-            styled_fig(fig, 230); st.plotly_chart(fig, use_container_width=True)
+            styled_fig(fig, 230); st.plotly_chart(fig, width="stretch")
+        render_ai_panel(
+            "AI Customer Summary",
+            f"Customer: {chosen}\nPurchase history:\n{df_for_ai(hist, limit=60)}",
+            "customer_ai",
+            "Summarize this customer's buying pattern, pending amount risk, and what I should do next.",
+        )
 
 
 def page_generate_bill():
@@ -3532,7 +4623,7 @@ def page_generate_bill():
         preview["status"] = hist.apply(bill_status, axis=1)
         preview["last_payment_date"] = hist.apply(bill_paid_date, axis=1)
         preview.columns = ["Date","Category","Description","Bill ₹","Paid ₹","Pending ₹","Paid Date","Status"]
-        st.dataframe(preview, use_container_width=True, hide_index=True)
+        st.dataframe(preview, width="stretch", hide_index=True)
 
     dc, _ = st.columns([1, 3])
     with dc:
@@ -3561,7 +4652,7 @@ def page_generate_bill():
     history_show = history_df[["bill_id","customer_name","customer_phone","bill_scope_label","bill_date","generated_at","purchase_count","total_bill","total_paid","total_pending","generated_by"]].copy()
     history_show["generated_at"] = pd.to_datetime(history_show["generated_at"], errors="coerce").dt.strftime("%d %b %Y, %I:%M %p").fillna(history_show["generated_at"])
     history_show.columns = ["Bill ID","Customer","Phone","Type","Bill Date","Generated On","Purchases","Total Bill ₹","Paid ₹","Pending ₹","Generated By"]
-    st.dataframe(history_show, use_container_width=True, hide_index=True)
+    st.dataframe(history_show, width="stretch", hide_index=True)
 
     selected_bill_id = st.selectbox("View Bill Details", history_show["Bill ID"].tolist(), key="bill_history_detail")
     selected_doc = next((doc for doc in history if doc.get("bill_id") == selected_bill_id), None)
@@ -3578,7 +4669,13 @@ def page_generate_bill():
             item_cols = ["sale_id","sale_date","category","description","bill_amount","paid_amount","pending_amount","paid_date","status"]
             items_df = items_df[[c for c in item_cols if c in items_df.columns]].copy()
             items_df.columns = ["Sale ID","Sale Date","Category","Description","Bill ₹","Paid ₹","Pending ₹","Paid Date","Status"][:len(items_df.columns)]
-            st.dataframe(items_df, use_container_width=True, hide_index=True)
+            st.dataframe(items_df, width="stretch", hide_index=True)
+            render_ai_panel(
+                "AI Bill Message",
+                f"Bill document:\n{pd.DataFrame([selected_doc]).drop(columns=['items'], errors='ignore').to_csv(index=False)}\nItems:\n{items_df.to_csv(index=False)}",
+                "bill_ai",
+                "Draft a short polite customer message for this bill. Mention pending amount if any and keep it WhatsApp-friendly.",
+            )
 
 
 def page_analytics():
@@ -3609,13 +4706,13 @@ def page_analytics():
             fig.add_trace(go.Bar(x=monthly["month"], y=monthly["revenue"], name="Revenue", marker_color="rgba(46,111,216,0.4)", marker_line_color="#2E6FD8", marker_line_width=1))
             fig.add_trace(go.Scatter(x=monthly["month"], y=monthly["profit"], name="Profit", mode="lines+markers", line=dict(color="#7ADFA0", width=2), marker=dict(size=5)))
             styled_fig(fig).update_layout(title="Revenue & Profit by Month", barmode="overlay", legend=dict(orientation="h", y=1.18, x=0))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         with c2:
             daily = df.set_index("sale_date")["selling_price"].resample("D").sum().reset_index()
             daily.columns = ["date","revenue"]
             fig2 = px.area(daily, x="date", y="revenue", title="Daily Revenue")
             fig2.update_traces(fillcolor="rgba(46,111,216,0.12)", line_color="#2E6FD8", line_width=1.5)
-            styled_fig(fig2); st.plotly_chart(fig2, use_container_width=True)
+            styled_fig(fig2); st.plotly_chart(fig2, width="stretch")
         c3, c4 = st.columns(2)
         with c3:
             dow_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -3623,63 +4720,63 @@ def page_analytics():
             dow["dow"] = pd.Categorical(dow["dow"], categories=dow_order, ordered=True)
             dow = dow.sort_values("dow")
             fig3 = px.bar(dow, x="dow", y="sales", title="Sales by Day of Week", color="revenue", color_continuous_scale=[[0,"#070C18"],[1,"#2E6FD8"]])
-            styled_fig(fig3); st.plotly_chart(fig3, use_container_width=True)
+            styled_fig(fig3); st.plotly_chart(fig3, width="stretch")
         with c4:
             monthly["MoM Growth %"] = monthly["revenue"].pct_change()*100
             fig4 = px.bar(monthly.dropna(), x="month", y="MoM Growth %", title="Month-over-Month Growth", color="MoM Growth %", color_continuous_scale=[[0,"#C05060"],[0.5,"#0F1A2E"],[1,"#7ADFA0"]])
-            styled_fig(fig4); st.plotly_chart(fig4, use_container_width=True)
+            styled_fig(fig4); st.plotly_chart(fig4, width="stretch")
 
     with t2:
         c1, c2 = st.columns(2)
         with c1:
             top_c = df.groupby("customer_name")["selling_price"].sum().nlargest(10).reset_index()
             fig5 = px.bar(top_c, x="selling_price", y="customer_name", orientation="h", title="Top 10 Customers by Revenue", color="selling_price", color_continuous_scale=[[0,"#070C18"],[1,"#2E6FD8"]])
-            styled_fig(fig5); fig5.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig5, use_container_width=True)
+            styled_fig(fig5); fig5.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig5, width="stretch")
         with c2:
             cp = df.groupby("customer_name")["pending_amount"].sum()
             cp = cp[cp > 0].nlargest(10).reset_index()
             if not cp.empty:
                 fig6 = px.bar(cp, x="pending_amount", y="customer_name", orientation="h", title="Top Customers by Pending", color="pending_amount", color_continuous_scale=[[0,"#070C18"],[1,"#C05060"]])
-                styled_fig(fig6); fig6.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig6, use_container_width=True)
+                styled_fig(fig6); fig6.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig6, width="stretch")
             else:
                 st.success("No pending amounts.")
         cust_stats = df.groupby("customer_name").agg(visits=("id","count"), revenue=("selling_price","sum"), avg_order=("selling_price","mean")).reset_index()
         fig_scatter = px.scatter(cust_stats, x="visits", y="revenue", size="avg_order", hover_name="customer_name", title="Customer Value Matrix", color="revenue", color_continuous_scale=[[0,"#070C18"],[1,"#2E6FD8"]])
-        styled_fig(fig_scatter, 330); st.plotly_chart(fig_scatter, use_container_width=True)
+        styled_fig(fig_scatter, 330); st.plotly_chart(fig_scatter, width="stretch")
         seg = df.groupby("customer_name").agg(spend=("selling_price","sum")).reset_index()
         seg["tier"] = pd.cut(seg["spend"], bins=[0,5000,20000,50000,float("inf")], labels=["Bronze","Silver","Gold","Platinum"])
         sec("Customer Tier Distribution")
         sg = seg.groupby("tier", observed=True).agg(customers=("customer_name","count"), total=("spend","sum")).reset_index()
         sg.columns = ["Tier","Customers","Total Spend ₹"]
-        st.dataframe(sg, use_container_width=True, hide_index=True)
+        st.dataframe(sg, width="stretch", hide_index=True)
 
     with t3:
         c1, c2 = st.columns(2)
         with c1:
             cd = df.groupby("product_category").size().reset_index(name="count")
             fig7 = px.pie(cd, values="count", names="product_category", title="Sales Volume by Category", hole=0.55, color_discrete_sequence=["#2E6FD8","#4D8AE8","#7ADFA0","#8BACD8","#E08090","#1A3D80","#3D9A6C","#4A9AC8","#9B9070","#A8C4F0"])
-            styled_fig(fig7); st.plotly_chart(fig7, use_container_width=True)
+            styled_fig(fig7); st.plotly_chart(fig7, width="stretch")
         with c2:
             cp2 = df.groupby("product_category").agg(profit=("profit","sum"), revenue=("selling_price","sum")).reset_index()
             cp2["margin"] = (cp2["profit"]/cp2["revenue"]*100).round(1)
             fig8 = px.bar(cp2, x="product_category", y="profit", title="Profit by Category", color="margin", color_continuous_scale=[[0,"#070C18"],[1,"#7ADFA0"]])
-            styled_fig(fig8); st.plotly_chart(fig8, use_container_width=True)
+            styled_fig(fig8); st.plotly_chart(fig8, width="stretch")
         cm = df.groupby(["month","product_category"])["selling_price"].sum().unstack(fill_value=0)
         if not cm.empty:
             fig9 = px.imshow(cm.T, title="Category × Month Heatmap", color_continuous_scale=[[0,"#070C18"],[0.4,"#1A3D80"],[1,"#2E6FD8"]], aspect="auto")
-            styled_fig(fig9, 300); st.plotly_chart(fig9, use_container_width=True)
+            styled_fig(fig9, 300); st.plotly_chart(fig9, width="stretch")
 
     with t4:
         c1, c2 = st.columns(2)
         with c1:
             pm = df.groupby("payment_method").size().reset_index(name="count")
             fig10 = px.pie(pm, values="count", names="payment_method", title="Payment Method Distribution", hole=0.58, color_discrete_sequence=["#2E6FD8","#4D8AE8","#7ADFA0","#8BACD8","#1A3D80","#E08090"])
-            styled_fig(fig10); st.plotly_chart(fig10, use_container_width=True)
+            styled_fig(fig10); st.plotly_chart(fig10, width="stretch")
         with c2:
             ps = df.groupby("payment_received").agg(count=("id","count"), total=("pending_amount","sum")).reset_index()
             ps["label"] = ps["payment_received"].map({0:"Pending",1:"Received"})
             fig11 = px.bar(ps, x="label", y="count", title="Payment Status", color="label", color_discrete_map={"Pending":"#2E6FD8","Received":"#7ADFA0"})
-            styled_fig(fig11); st.plotly_chart(fig11, use_container_width=True)
+            styled_fig(fig11); st.plotly_chart(fig11, width="stretch")
         aged = df[df["pending_amount"] > 0].copy()
         if not aged.empty:
             today_ts = pd.Timestamp(date.today())
@@ -3687,7 +4784,7 @@ def page_analytics():
             aged["bucket"] = pd.cut(aged["days"], bins=[0,7,15,30,60,9999], labels=["0–7d","8–15d","16–30d","31–60d","60d+"])
             ag = aged.groupby("bucket", observed=True)["pending_amount"].sum().reset_index()
             fig12 = px.bar(ag, x="bucket", y="pending_amount", title="Pending — Aging Buckets", color="pending_amount", color_continuous_scale=[[0,"#2E6FD8"],[1,"#C05060"]])
-            styled_fig(fig12); st.plotly_chart(fig12, use_container_width=True)
+            styled_fig(fig12); st.plotly_chart(fig12, width="stretch")
         else:
             st.success("No pending payments.")
 
@@ -3698,7 +4795,7 @@ def page_analytics():
                 vd = (df[df["vendor"].astype(str).str.strip() != ""].groupby("vendor").agg(revenue=("selling_price","sum"), items=("id","count")).nlargest(10,"revenue").reset_index())
                 if not vd.empty:
                     fig13 = px.bar(vd, x="revenue", y="vendor", orientation="h", title="Top Vendors by Revenue", color="revenue", color_continuous_scale=[[0,"#070C18"],[1,"#2E6FD8"]])
-                    styled_fig(fig13); fig13.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig13, use_container_width=True)
+                    styled_fig(fig13); fig13.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig13, width="stretch")
                 else:
                     st.info("Add vendor names to see this chart.")
         with c2:
@@ -3708,9 +4805,21 @@ def page_analytics():
                     tm = (pd2.groupby("product_description").agg(margin=("margin","mean"), revenue=("selling_price","sum")).nlargest(10,"margin").reset_index())
                     tm["product_description"] = tm["product_description"].str[:30]
                     fig14 = px.bar(tm, x="margin", y="product_description", orientation="h", title="Top Products by Margin %", color="margin", color_continuous_scale=[[0,"#070C18"],[1,"#7ADFA0"]])
-                    styled_fig(fig14); fig14.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig14, use_container_width=True)
+                    styled_fig(fig14); fig14.update_layout(yaxis=dict(autorange="reversed")); st.plotly_chart(fig14, width="stretch")
                 else:
                     st.info("Add product descriptions to see this chart.")
+
+    analytics_context = "\n\n".join([
+        "Monthly summary:\n" + df_for_ai(df.groupby("month").agg(revenue=("selling_price","sum"), profit=("profit","sum"), sales=("id","count")).reset_index(), limit=30),
+        "Category summary:\n" + df_for_ai(df.groupby("product_category").agg(revenue=("selling_price","sum"), profit=("profit","sum"), sales=("id","count")).reset_index(), limit=30),
+        "Payment summary:\n" + df_for_ai(df.groupby("payment_method").agg(count=("id","count"), revenue=("selling_price","sum"), pending=("pending_amount","sum")).reset_index(), limit=30),
+    ])
+    render_ai_panel(
+        "AI Analytics Insights",
+        analytics_context,
+        "analytics_ai",
+        "Explain the strongest business insights from these analytics and give practical next actions.",
+    )
 
 
 def page_reminders():
@@ -3748,11 +4857,11 @@ def page_reminders():
                     ca.write(r["sale_date"].strftime("%d %b %Y"))
                     cb.write(r.get("product_category","—"))
                     with cc:
-                        if st.button("Mark Paid", key=f"op_{row_id}", use_container_width=True):
+                        if st.button("Mark Paid", key=f"op_{row_id}", width="stretch"):
                             st.session_state.overdue_payment_editor_id = row_id
                             st.rerun()
                     with cd:
-                        if st.button("Remind", key=f"or_{row_id}", use_container_width=True):
+                        if st.button("Remind", key=f"or_{row_id}", width="stretch"):
                             st.toast(f"Reminder noted for {r['customer_name']}.")
                     with ce:
                         render_customer_bill_download(df, r["customer_name"], key=f"overdue_bill_{row_id}", label="Bill PDF")
@@ -3770,9 +4879,9 @@ def page_reminders():
                                 received_by = st.text_input("Received By", value=default_receiver_name(), key=f"overdue_payment_received_by_{row_id}")
                             save_col, cancel_col = st.columns(2)
                             with save_col:
-                                save_payment = st.form_submit_button("Save Payment", use_container_width=True)
+                                save_payment = st.form_submit_button("Save Payment", width="stretch")
                             with cancel_col:
-                                cancel_payment = st.form_submit_button("Cancel", use_container_width=True)
+                                cancel_payment = st.form_submit_button("Cancel", width="stretch")
                             if save_payment:
                                 if not payment_ok:
                                     st.error("Payment amount must be a valid number.")
@@ -3797,7 +4906,7 @@ def page_reminders():
             show = dl[["customer_name","sale_date","product_category","selling_price","pending_amount","days_old"]].copy()
             show["sale_date"] = show["sale_date"].dt.strftime("%d %b %Y")
             show.columns = ["Customer","Date","Category","Amount ₹","Pending ₹","Days Old"]
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(show, width="stretch", hide_index=True)
             sc = st.selectbox("Clear flag for:", dl["id"].tolist(), format_func=lambda x: f"#{x} — {dl[dl['id']==x]['customer_name'].values[0]}")
             if st.button("Clear Flag"):
                 get_col().update_one({"id": sc}, {"$set": {"delay_status":0}})
@@ -3812,7 +4921,7 @@ def page_reminders():
             hv["payment_received"] = hv["payment_received"].map({0:"Pending",1:"Paid"})
             show = hv[["customer_name","sale_date","product_category","selling_price","profit","payment_received"]].copy()
             show.columns = ["Customer","Date","Category","Amount ₹","Profit ₹","Status"]
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(show, width="stretch", hide_index=True)
 
     with t4:
         soon = df[(df["pending_amount"] > 0) & (df["days_old"] >= 7) & (df["days_old"] <= 30) & (df["delay_status"] == 0)].sort_values("days_old", ascending=False)
@@ -3823,7 +4932,7 @@ def page_reminders():
             show = soon[["customer_name","customer_phone","sale_date","product_category","pending_amount","days_old"]].copy()
             show["sale_date"] = show["sale_date"].dt.strftime("%d %b %Y")
             show.columns = ["Customer","Phone","Date","Category","Pending ₹","Days Old"]
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            st.dataframe(show, width="stretch", hide_index=True)
             sec("Bill PDFs")
             for customer in sorted(soon["customer_name"].dropna().astype(str).unique(), key=str.casefold):
                 c1, c2 = st.columns([3, 1])
@@ -3831,6 +4940,17 @@ def page_reminders():
                 c1.write(f"**{customer}** · ₹{pending_total:,.2f} pending")
                 with c2:
                     render_customer_bill_download(df, customer, key=f"upcoming_bill_{re.sub(r'[^0-9A-Za-z]+', '_', customer)}", label="Bill PDF")
+
+    reminder_context = "\n\n".join([
+        "Overdue rows:\n" + df_for_ai(df[(df["pending_amount"] > 0) & (df["days_old"] > 30)].sort_values("days_old", ascending=False), ["customer_name","customer_phone","sale_date","product_category","pending_amount","days_old"], 40),
+        "Upcoming rows:\n" + df_for_ai(df[(df["pending_amount"] > 0) & (df["days_old"] >= 7) & (df["days_old"] <= 30)].sort_values("days_old", ascending=False), ["customer_name","customer_phone","sale_date","product_category","pending_amount","days_old"], 40),
+    ])
+    render_ai_panel(
+        "AI Follow-up Planner",
+        reminder_context,
+        "reminders_ai",
+        "Prioritize payment follow-ups and draft short WhatsApp reminder message templates.",
+    )
 
 
 def page_inventory():
@@ -3859,11 +4979,11 @@ def page_inventory():
             if cat_f != "All" and "category" in view.columns: view = view[view["category"] == cat_f]
             if "quantity" in view.columns and "min_stock" in view.columns:
                 view["Status"] = view.apply(lambda r: "Out of Stock" if r["quantity"]==0 else ("Low Stock" if r["quantity"]<=r["min_stock"] else "OK"), axis=1)
-            st.dataframe(view, use_container_width=True, hide_index=True)
+            st.dataframe(view, width="stretch", hide_index=True)
             if "category" in inv_df.columns and "quantity" in inv_df.columns:
                 cat_stock = inv_df.groupby("category")["quantity"].sum().reset_index()
                 fig = px.bar(cat_stock, x="category", y="quantity", title="Stock by Category", color="quantity", color_continuous_scale=[[0,"#C05060"],[0.4,"#2E6FD8"],[1,"#7ADFA0"]])
-                styled_fig(fig, 260); st.plotly_chart(fig, use_container_width=True)
+                styled_fig(fig, 260); st.plotly_chart(fig, width="stretch")
 
     with t2:
         sec("Add or Update Stock Item")
@@ -3880,7 +5000,7 @@ def page_inventory():
                 item_cost = st.number_input("Cost Price (₹) *", min_value=0.0, step=50.0, format="%.2f")
                 item_mrp  = st.number_input("Selling Price (₹)",min_value=0.0, step=50.0, format="%.2f")
             item_notes = st.text_area("Notes", height=55)
-            if st.form_submit_button("Save Item", use_container_width=True):
+            if st.form_submit_button("Save Item", width="stretch"):
                 if not item_name.strip():
                     st.error("Item name is required.")
                 else:
@@ -3891,6 +5011,23 @@ def page_inventory():
                     )
                     st.success(f"'{item_name.strip()}' saved to inventory.")
                     st.rerun()
+
+    inv_docs = list(inv_col.find({}, {"_id": 0}))
+    sales_df = fetch_all()
+    inventory_context = "\n\n".join([
+        "Inventory:\n" + df_for_ai(pd.DataFrame(inv_docs) if inv_docs else pd.DataFrame(), limit=120),
+        "Recent sales demand:\n" + df_for_ai(
+            sales_df.sort_values("sale_date", ascending=False) if not sales_df.empty else sales_df,
+            ["sale_date", "vendor", "product_category", "product_description", "quantity", "selling_price", "profit", "pending_amount"],
+            80,
+        ),
+    ])
+    render_ai_panel(
+        "AI Inventory Planner",
+        inventory_context,
+        "inventory_ai",
+        "Suggest what to restock, what is slow-moving, which vendors/categories deserve attention, and any pricing or margin actions.",
+    )
 
 # =====================================================
 # BACKUP & RESTORE PAGE
@@ -3938,7 +5075,7 @@ def page_backup_restore():
             data=csv_data,
             file_name=f"boutique_checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         st.caption("Includes all sales, customer, and payment records")
 
@@ -3953,7 +5090,7 @@ def page_backup_restore():
                 data=excel_data,
                 file_name=f"boutique_checkpoint_{ts_str}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
             )
             st.caption("Formatted spreadsheet with column headers and styling")
         else:
@@ -3962,7 +5099,7 @@ def page_backup_restore():
         if last_backup_ts:
             st.markdown(f"<div class='bk-ts'>Last export: {last_backup_ts}</div>", unsafe_allow_html=True)
 
-        if st.button("📋  Record Manual Backup Note", use_container_width=True):
+        if st.button("📋  Record Manual Backup Note", width="stretch"):
             ts = datetime.now().strftime("%d %b %Y, %I:%M %p")
             st.session_state.last_backup_ts = ts
             st.success(f"✓ Manual backup noted at {ts}")
@@ -4014,7 +5151,7 @@ def page_backup_restore():
                 </div>
                 """, unsafe_allow_html=True)
 
-                st.dataframe(restore_df.head(5), use_container_width=True, hide_index=True)
+                st.dataframe(restore_df.head(5), width="stretch", hide_index=True)
 
                 st.warning(
                     "⚠️  This will **insert** records from the checkpoint into the live database. "
@@ -4023,7 +5160,7 @@ def page_backup_restore():
 
                 confirm = st.checkbox("I understand — proceed with restore")
                 if confirm:
-                    if st.button("🔄  Restore Database from Checkpoint", use_container_width=True):
+                    if st.button("🔄  Restore Database from Checkpoint", width="stretch"):
                         progress_placeholder = st.empty()
                         progress_placeholder.markdown(
                             "<div style='background:var(--bg-2);border-radius:999px;overflow:hidden;height:6px;margin:0.5rem 0'>"
@@ -4168,7 +5305,161 @@ def page_backup_restore():
     c5.metric("Data Health",    "✓ Live" if m["sales"] > 0 else "Empty")
 
     rule_sm()
+    backup_context = "\n\n".join([
+        f"Last backup noted: {last_backup_ts or 'none'}",
+        f"Last restore noted: {last_restore_ts or 'none'}",
+        f"Current metrics: sales={m['sales']}, revenue={m['revenue']:.2f}, profit={m['profit']:.2f}, pending={m['pending']:.2f}, customers={m['customers']}",
+        "Recent records:\n" + df_for_ai(
+            df2.sort_values("sale_date", ascending=False) if not df2.empty and "sale_date" in df2.columns else df2,
+            ["id", "customer_name", "sale_date", "vendor", "product_category", "selling_price", "amount_paid", "pending_amount", "payment_received", "created_at"],
+            80,
+        ),
+    ])
+    render_ai_panel(
+        "AI Backup & Data Health Audit",
+        backup_context,
+        "backup_ai",
+        "Check backup freshness, data quality risks, duplicate/odd-looking records, and the safest next backup or restore action.",
+    )
+
+    rule_sm()
     st.caption(f"Database last queried: {datetime.now().strftime('%d %b %Y, %I:%M:%S %p')}  ·  Boutique Manager v2.0")
+
+def page_work_notes():
+    page_header("Work Notes", "Manual Last Edited Log")
+
+    notes = get_work_notes()
+    latest = notes[0] if notes else None
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Last Noted Date", latest.get("work_date", "—") if latest else "—")
+    c2.metric("Total Notes", len(notes))
+    c3.metric("Last Saved By", latest.get("created_by", "—") if latest else "—")
+
+    rule_sm()
+    sec("Add Note")
+    with st.form("work_note_form"):
+        d1, d2 = st.columns([1, 2])
+        with d1:
+            work_date = st.date_input("Date You Worked", value=date.today(), key="work_note_date")
+        with d2:
+            note = st.text_input("Note", placeholder="Example: Updated accounts / checked passbook / entered pending payments", key="work_note_text")
+        save_note = st.form_submit_button("Save Note", width="stretch")
+
+    if save_note:
+        save_work_note(work_date, note)
+        st.success(f"Saved note for {work_date}.")
+        st.rerun()
+
+    rule_sm()
+    sec("History")
+    notes = get_work_notes()
+    if not notes:
+        st.info("No work notes saved yet.")
+        return
+
+    note_df = pd.DataFrame(notes)
+    show = note_df[["id", "work_date", "note", "created_at", "created_by"]].copy()
+    show["created_at"] = pd.to_datetime(show["created_at"], errors="coerce").dt.strftime("%d %b %Y, %I:%M %p").fillna(show["created_at"])
+    show.columns = ["ID", "Date", "Note", "Saved On", "Saved By"]
+    st.dataframe(show, width="stretch", hide_index=True, height=420)
+
+    d1, d2 = st.columns([1, 3])
+    with d1:
+        delete_id = st.selectbox("Delete Note ID", show["ID"].tolist(), key="work_note_delete_id")
+    with d2:
+        st.caption("Delete only removes this manual note. It does not affect sales, bills, vendors, or passbook data.")
+        if st.button("Delete Selected Note", key="work_note_delete", width="stretch"):
+            delete_work_note(int(delete_id))
+            st.success(f"Deleted note #{delete_id}.")
+            st.rerun()
+
+    render_ai_panel(
+        "AI Work Notes Summary",
+        "Work notes:\n" + show.to_csv(index=False),
+        "work_notes_ai",
+        "Summarize what work was done recently and suggest the next bookkeeping actions.",
+    )
+
+def build_ai_business_context() -> str:
+    df = fetch_all()
+    m = metrics(df)
+    parts = [
+        f"Today: {date.today()}",
+        f"Metrics: sales={m['sales']}, revenue={m['revenue']:.2f}, profit={m['profit']:.2f}, pending={m['pending']:.2f}, customers={m['customers']}",
+    ]
+    if not df.empty:
+        recent_cols = ["id", "customer_name", "customer_phone", "sale_date", "vendor", "product_category", "selling_price", "amount_paid", "pending_amount", "payment_method", "last_payment_date"]
+        parts.append("Recent sales:\n" + df_for_ai(df.sort_values("sale_date", ascending=False), recent_cols, 30))
+        pending = df[df["pending_amount"].map(money_value) > 0].sort_values("pending_amount", ascending=False)
+        parts.append("Pending sales:\n" + df_for_ai(pending, recent_cols, 30))
+        customer_summary = (df.groupby("customer_name").agg(
+            transactions=("id", "count"),
+            total_spent=("selling_price", "sum"),
+            total_pending=("pending_amount", "sum"),
+            last_sale=("sale_date", "max"),
+        ).reset_index().sort_values("total_pending", ascending=False))
+        parts.append("Customer summary:\n" + df_for_ai(customer_summary, limit=30))
+    try:
+        notes = get_work_notes(20)
+        if notes:
+            parts.append("Recent work notes:\n" + pd.DataFrame(notes).to_csv(index=False))
+    except Exception:
+        pass
+    try:
+        inv_docs = list(get_db()["inventory"].find({}, {"_id": 0}).limit(120))
+        if inv_docs:
+            parts.append("Inventory:\n" + df_for_ai(pd.DataFrame(inv_docs), limit=120))
+    except Exception:
+        pass
+    try:
+        bills = list(bill_history_collection().find({}, {"_id": 0}).sort("generated_at", -1).limit(50))
+        if bills:
+            parts.append("Recent bills:\n" + df_for_ai(pd.DataFrame(bills), limit=50))
+    except Exception:
+        pass
+    try:
+        keys = list(auth_keys_collection().find({}, {"_id": 0, "public_key_hash": 0}).sort("created_at", -1).limit(50))
+        invites = list(auth_qr_collection().find({}, {"_id": 0, "secret_hash": 0, "pin_hash": 0}).sort("created_at", -1).limit(50))
+        devices = list(auth_devices_collection().find({}, {"_id": 0, "user_agent": 0}).sort("last_login_at", -1).limit(50))
+        if keys:
+            parts.append("Encrypted key logins:\n" + df_for_ai(pd.DataFrame(keys), limit=50))
+        if invites:
+            parts.append("Temporary QR invites:\n" + df_for_ai(pd.DataFrame(invites), limit=50))
+        if devices:
+            parts.append("Login devices:\n" + df_for_ai(pd.DataFrame(devices), limit=50))
+    except Exception:
+        pass
+    return "\n\n".join(parts)
+
+def page_ai_assistant():
+    page_header("AI Assistant", "Ask About Boutique Data")
+    if not llm_is_configured():
+        st.info(ai_setup_message())
+        return
+
+    context = build_ai_business_context()
+    quick = st.selectbox("Quick Question", [
+        "Summarize today's business status and what needs attention.",
+        "List customers with the most pending amount and suggest follow-up priority.",
+        "Find sales or vendors that look unusual.",
+        "Draft polite payment reminder messages for pending customers.",
+        "Summarize recent work notes and next actions.",
+        "Review inventory and suggest restock or slow-moving item actions.",
+        "Review login security and suggest keys/devices/QR invites to revoke.",
+        "Audit backup readiness and data quality risks.",
+        "Custom question",
+    ])
+    default_task = "" if quick == "Custom question" else quick
+    question = st.text_area("Question", value=default_task, height=120, key="global_ai_question")
+    if st.button("Ask AI", key="global_ai_run", width="stretch"):
+        try:
+            with st.spinner("Thinking..."):
+                st.session_state.global_ai_answer = ask_llm(question, context)
+        except Exception as exc:
+            st.error(str(exc))
+    if st.session_state.get("global_ai_answer"):
+        rule_sm()
+        st.markdown(st.session_state.global_ai_answer)
 
 
 # =====================================================
@@ -4180,17 +5471,22 @@ def main():
         st.session_state.logged_in = False
     if "theme" not in st.session_state:
         st.session_state.theme = "light"
+    if st.session_state.logged_in and "user_role" not in st.session_state:
+        st.session_state.user_role = "admin"
 
     # Apply light mode CSS overrides if needed
     inject_theme()
-
-    if not st.session_state.logged_in:
-        handle_qr_query_login()
+    ensure_auth_indexes()
 
     if not st.session_state.logged_in:
         render_admin_login_strip()
         page_add_sale(public=True)
         return
+
+    if _current_auth_device_revoked():
+        st.warning("This login device has been revoked.")
+        _clear_auth_state()
+        st.rerun()
 
     page = sidebar()
 
@@ -4202,12 +5498,19 @@ def main():
     elif "Analytics"   in page: page_analytics()
     elif "Reminders"   in page: page_reminders()
     elif "Generate Bill" in page: page_generate_bill()
-    elif "Manage Logins" in page: page_manage_logins()
+    elif "Passbook Reader" in page: page_passbook_reader()
+    elif "Work Notes"  in page: page_work_notes()
+    elif "AI Assistant" in page: page_ai_assistant()
+    elif "Security"    in page: page_security_devices()
     elif "Backup"      in page: page_backup_restore()
     elif "Logout"      in page:
-        st.session_state.logged_in = False
-        st.session_state.username  = None
-        st.session_state.auth_method = None
+        device_id = st.session_state.get("auth_device_id")
+        if device_id:
+            auth_devices_collection().update_one(
+                {"_id": device_id},
+                {"$set": {"active": False, "logged_out_at": datetime.now()}},
+            )
+        _clear_auth_state()
         st.rerun()
 
 if __name__ == "__main__":
