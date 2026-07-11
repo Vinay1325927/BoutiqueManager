@@ -1,6 +1,8 @@
 streamlit
 pymongo
-pandas
+pandas==2.2.3
+numpy==1.26.4
+pyarrow==17.0.0
 plotly
 bcrypt
 python-dotenv
@@ -12,4 +14,3 @@ pdfplumber
 pypdf
 google-genai
 setuptools<81
-numpy
