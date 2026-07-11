@@ -22,13 +22,6 @@ except ImportError:
     qrcode = None
 
 try:
-    import cv2
-    import numpy as np
-except ImportError:
-    cv2 = None
-    np = None
-
-try:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 except ImportError:
@@ -1927,7 +1920,12 @@ def page_add_sale(public=False):
     else:
         page_header("New Sale", "Record a Transaction")
 
-    ctype = st.radio("", ["New Customer", "Existing Customer"], horizontal=True)
+    ctype = st.radio(
+        "Customer Type",
+        ["New Customer", "Existing Customer"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
     rule_sm()
 
     cname, cphone = "", ""
@@ -2259,8 +2257,11 @@ def _qr_png_bytes(payload: str) -> BytesIO:
 
 
 def _decode_qr_image(file_obj) -> tuple[str, str | None]:
-    if cv2 is None or np is None:
-        return "", "QR scanning requires opencv-python-headless and numpy in requirements.txt."
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return "", "QR image scanning is not available on this server. Use the QR token paste box or generate a QR with an App Login URL."
 
     try:
         raw = file_obj.getvalue()
