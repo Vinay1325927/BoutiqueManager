@@ -28,6 +28,13 @@ except ImportError:
     cv2 = None
     np = None
 
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+except ImportError:
+    serialization = None
+    rsa = None
+
 load_dotenv("credentials/.env")
 
 BRAND_NAME = "Shree Krishna Boutique"
@@ -2075,6 +2082,8 @@ _QR_TOKEN_PREFIX = "SKB-QR1"
 _QR_TOKEN_BYTES = 48
 _QR_DEFAULT_MINUTES = 15
 _QR_MAX_DAYS = 7
+_KEY_DEFAULT_DAYS = 30
+_KEY_MAX_DAYS = 365
 
 def _get_stored_hash() -> bytes | None:
     """
@@ -2160,6 +2169,10 @@ def _verify_credentials(username: str, password: str) -> bool:
 
 def _qr_login_collection():
     return get_db()["qr_login_tokens"]
+
+
+def _key_login_collection():
+    return get_db()["encrypted_key_logins"]
 
 
 def _qr_login_now() -> datetime:
@@ -2426,6 +2439,170 @@ def get_qr_login_docs(limit: int = 50) -> list[dict]:
         return []
 
 
+def _crypto_available() -> bool:
+    return serialization is not None and rsa is not None
+
+
+def _clean_key_label(value: str) -> str:
+    label = re.sub(r"\s+", " ", str(value or "")).strip()
+    return label[:80]
+
+
+def _private_key_public_hash(private_key) -> str:
+    public_der = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(public_der).hexdigest()
+
+
+def _format_key_fingerprint(public_key_hash: str) -> str:
+    short_hash = str(public_key_hash or "")[:32]
+    return ":".join(short_hash[i:i + 2] for i in range(0, len(short_hash), 2))
+
+
+def _load_private_key_from_pem(pem_text: str, passphrase: str = ""):
+    if not _crypto_available():
+        raise RuntimeError("Install cryptography to use encrypted key login.")
+
+    raw = str(pem_text or "").strip().encode("utf-8")
+    if not raw:
+        raise ValueError("Upload or paste a private key first.")
+
+    password = str(passphrase or "").encode("utf-8") or None
+    try:
+        return serialization.load_pem_private_key(raw, password=password)
+    except TypeError as exc:
+        if password:
+            raise ValueError("Private key passphrase is incorrect.") from exc
+        raise ValueError("This private key is encrypted. Enter its passphrase.") from exc
+    except ValueError as exc:
+        raise ValueError("Invalid private key. Upload or paste a valid PEM private key.") from exc
+
+
+def _key_login_status(doc: dict, now: datetime | None = None) -> str:
+    now = now or _qr_login_now()
+    expires_at = _as_utc_naive(doc.get("expires_at"))
+    uses = int(doc.get("uses", 0) or 0)
+    max_uses = max(int(doc.get("max_uses", 0) or 0), 0)
+
+    if doc.get("revoked_at"):
+        return "Revoked"
+    if expires_at and expires_at <= now:
+        return "Expired"
+    if max_uses and uses >= max_uses:
+        return "Used"
+    return "Active"
+
+
+def create_encrypted_key_login(for_user: str, valid_days: int, max_uses: int = 0, note: str = "") -> tuple[bytes, dict]:
+    if not _crypto_available():
+        raise RuntimeError("Install cryptography to generate encrypted key logins.")
+
+    for_user = _clean_key_label(for_user)
+    if not for_user:
+        raise ValueError("Enter who this encrypted key is for.")
+
+    valid_days = max(1, min(int(valid_days or _KEY_DEFAULT_DAYS), _KEY_MAX_DAYS))
+    max_uses = max(0, min(int(max_uses or 0), 1000))
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_key_hash = _private_key_public_hash(private_key)
+    now = _qr_login_now()
+    doc = {
+        "public_key_hash": public_key_hash,
+        "fingerprint": _format_key_fingerprint(public_key_hash),
+        "for_user": for_user,
+        "created_by": st.session_state.get("username", "Admin"),
+        "created_at": now,
+        "expires_at": now + timedelta(days=valid_days),
+        "uses": 0,
+        "max_uses": max_uses,
+        "note": str(note or "").strip()[:200],
+    }
+    result = _key_login_collection().insert_one(doc.copy())
+    doc["_id"] = result.inserted_id
+    return private_pem, doc
+
+
+def consume_encrypted_key_login(pem_text: str, passphrase: str = "") -> tuple[bool, str, dict | None]:
+    try:
+        private_key = _load_private_key_from_pem(pem_text, passphrase=passphrase)
+    except Exception as exc:
+        return False, str(exc), None
+
+    public_key_hash = _private_key_public_hash(private_key)
+    doc = _key_login_collection().find_one({"public_key_hash": public_key_hash})
+    if not doc:
+        return False, "Encrypted key was not found. Generate or register a valid key first.", None
+
+    status = _key_login_status(doc)
+    if status == "Revoked":
+        return False, "This encrypted key has been revoked.", None
+    if status == "Expired":
+        return False, "This encrypted key has expired. Generate a fresh key.", None
+    if status == "Used":
+        return False, "This encrypted key has reached its allowed login limit.", None
+
+    uses = int(doc.get("uses", 0) or 0)
+    now = _qr_login_now()
+    query = {
+        "_id": doc["_id"],
+        "public_key_hash": public_key_hash,
+        "uses": uses,
+        "expires_at": {"$gt": now},
+        "$or": [{"revoked_at": {"$exists": False}}, {"revoked_at": None}],
+    }
+
+    result = _key_login_collection().update_one(
+        query,
+        {
+            "$inc": {"uses": 1},
+            "$set": {
+                "last_used_at": now,
+                "last_used_by": _clean_key_label(doc.get("for_user")) or "Key User",
+            },
+        },
+    )
+    if result.modified_count != 1:
+        return False, "This encrypted key is no longer valid. Generate a fresh key.", None
+
+    doc["uses"] = uses + 1
+    doc["last_used_at"] = now
+    return True, "Encrypted key accepted.", doc
+
+
+def _complete_key_login(doc: dict):
+    username = _clean_key_label(doc.get("for_user")) or "Key User"
+    st.session_state.logged_in = True
+    st.session_state.username = username
+    st.session_state.auth_method = "encrypted_key"
+    st.session_state.login_attempts = 0
+    st.session_state.login_lock_until = 0
+
+
+def _process_key_login(pem_text: str, passphrase: str = "") -> bool:
+    ok, message, doc = consume_encrypted_key_login(pem_text, passphrase=passphrase)
+    if ok and doc:
+        _complete_key_login(doc)
+        st.session_state.key_login_success = f"Signed in with encrypted key as {doc.get('for_user', 'Key User')}."
+        st.rerun()
+        return True
+    st.error(message)
+    return False
+
+
+def get_encrypted_key_docs(limit: int = 50) -> list[dict]:
+    try:
+        return list(_key_login_collection().find({}, {"public_key_hash": 0}).sort("created_at", -1).limit(limit))
+    except Exception:
+        return []
+
+
 # =====================================================
 # ADMIN LOGIN
 # =====================================================
@@ -2437,12 +2614,18 @@ def render_admin_login_strip():
     with st.expander("Sign in to Admin Dashboard", expanded=False):
         qr_error = st.session_state.pop("qr_login_error", None)
         qr_success = st.session_state.pop("qr_login_success", None)
+        key_error = st.session_state.pop("key_login_error", None)
+        key_success = st.session_state.pop("key_login_success", None)
         if qr_error:
             st.error(qr_error)
         if qr_success:
             st.success(qr_success)
+        if key_error:
+            st.error(key_error)
+        if key_success:
+            st.success(key_success)
 
-        password_tab, qr_tab = st.tabs(["Password", "Scan QR Code"])
+        password_tab, qr_tab, key_tab = st.tabs(["Password", "Scan QR Code", "Encrypted Key"])
 
         with password_tab:
             # Credential config check for password login only. QR logins stay available.
@@ -2510,6 +2693,43 @@ def render_admin_login_strip():
                 else:
                     st.error("Scan a QR code or paste its token first.")
 
+        with key_tab:
+            st.caption("Upload or paste a registered PEM private key.")
+            if not _crypto_available():
+                st.warning("Encrypted key login requires the cryptography package.")
+
+            key_upload = st.file_uploader(
+                "Upload Private Key",
+                type=["pem", "key", "txt"],
+                key="login_key_upload",
+            )
+            pasted_key = st.text_area(
+                "Paste Private Key",
+                placeholder="-----BEGIN RSA PRIVATE KEY-----",
+                height=180,
+                key="login_key_paste",
+            )
+            key_passphrase = st.text_input(
+                "Private Key Passphrase",
+                type="password",
+                placeholder="Optional",
+                key="login_key_passphrase",
+            )
+            if st.button("Sign In With Encrypted Key", key="login_key_submit", use_container_width=True):
+                key_text = ""
+                if key_upload is not None:
+                    try:
+                        key_text = key_upload.getvalue().decode("utf-8")
+                    except UnicodeDecodeError:
+                        st.error("Private key file must be a text PEM file.")
+                if not key_text:
+                    key_text = pasted_key
+
+                if key_text.strip():
+                    _process_key_login(key_text, passphrase=key_passphrase)
+                else:
+                    st.error("Upload or paste your private key first.")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # =====================================================
@@ -2574,10 +2794,10 @@ def sidebar():
 # =====================================================
 
 def page_manage_logins():
-    page_header("Manage Logins", "Secure QR Code Access")
+    page_header("Manage Logins", "Secure QR & Encrypted Key Access")
     st.info(
-        "QR logins use high-entropy random tokens. Only the token hash is stored in MongoDB, "
-        "and each code can expire, be scan-limited, and be revoked."
+        "QR logins use high-entropy random tokens. Encrypted key logins use RSA PEM private keys. "
+        "Only hashes/fingerprints are stored in MongoDB, and access can expire or be revoked."
     )
 
     expiry_options = {
@@ -2684,23 +2904,135 @@ def page_manage_logins():
     sec("Recent QR Login Activity")
     if not docs:
         st.markdown("<div class='empty'><div class='empty-glyph'>◆</div><div>No QR login records yet.</div></div>", unsafe_allow_html=True)
-        return
+    else:
+        rows = []
+        for doc in docs:
+            uses = int(doc.get("uses", 0) or 0)
+            max_uses = int(doc.get("max_uses", 1) or 1)
+            rows.append({
+                "For Whom": doc.get("for_user", "QR User"),
+                "Status": _qr_login_status(doc),
+                "Scans": f"{uses}/{max_uses}",
+                "Expires": _format_qr_dt(doc.get("expires_at")),
+                "Created By": doc.get("created_by", "Admin"),
+                "Created": _format_qr_dt(doc.get("created_at")),
+                "Last Used": _format_qr_dt(doc.get("last_used_at")),
+                "Note": doc.get("note", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    rows = []
-    for doc in docs:
-        uses = int(doc.get("uses", 0) or 0)
-        max_uses = int(doc.get("max_uses", 1) or 1)
-        rows.append({
-            "For Whom": doc.get("for_user", "QR User"),
-            "Status": _qr_login_status(doc),
-            "Scans": f"{uses}/{max_uses}",
-            "Expires": _format_qr_dt(doc.get("expires_at")),
-            "Created By": doc.get("created_by", "Admin"),
-            "Created": _format_qr_dt(doc.get("created_at")),
-            "Last Used": _format_qr_dt(doc.get("last_used_at")),
-            "Note": doc.get("note", ""),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    rule()
+    sec("Generate Encrypted Key")
+    if not _crypto_available():
+        st.warning("Install cryptography to generate and use encrypted key logins.")
+    else:
+        k_left, k_right = st.columns([1.05, 0.95])
+        with k_left:
+            with st.form("encrypted_key_generate_form"):
+                key_user = st.text_input("Key For Whom", placeholder="Staff or device name")
+                key_valid_days = st.number_input(
+                    "Valid Days",
+                    min_value=1,
+                    max_value=_KEY_MAX_DAYS,
+                    value=_KEY_DEFAULT_DAYS,
+                    step=1,
+                )
+                key_max_uses = st.number_input(
+                    "Allowed Logins",
+                    min_value=0,
+                    max_value=1000,
+                    value=0,
+                    step=1,
+                    help="Use 0 for unlimited logins until expiry or revocation.",
+                )
+                key_note = st.text_input("Key Note", placeholder="Optional")
+                key_submitted = st.form_submit_button("Generate Encrypted Key", use_container_width=True)
+
+            if key_submitted:
+                try:
+                    private_pem, key_doc = create_encrypted_key_login(
+                        for_user=key_user,
+                        valid_days=int(key_valid_days),
+                        max_uses=int(key_max_uses),
+                        note=key_note,
+                    )
+                    safe_subject = re.sub(r"[^0-9A-Za-z]+", "_", key_doc["for_user"]).strip("_").lower() or "encrypted_key"
+                    st.session_state.last_encrypted_key = {
+                        "private_pem": private_pem.decode("utf-8"),
+                        "for_user": key_doc["for_user"],
+                        "fingerprint": key_doc["fingerprint"],
+                        "expires_at": key_doc["expires_at"].isoformat(),
+                        "file_name": f"{safe_subject}_encrypted_key.pem",
+                    }
+                    st.success(f"Encrypted key generated for {key_doc['for_user']}.")
+                except Exception as exc:
+                    st.error(str(exc))
+
+        with k_right:
+            latest_key = st.session_state.get("last_encrypted_key")
+            if latest_key:
+                pem_text = latest_key["private_pem"]
+                st.caption(f"Fingerprint: {latest_key['fingerprint']}")
+                st.caption(f"Expires: {_format_qr_dt(latest_key.get('expires_at'))}")
+                st.download_button(
+                    "Download Private Key PEM",
+                    data=pem_text.encode("utf-8"),
+                    file_name=latest_key["file_name"],
+                    mime="application/x-pem-file",
+                    use_container_width=True,
+                )
+                with st.expander("Emergency copy private key", expanded=False):
+                    st.code(pem_text)
+            else:
+                st.markdown(
+                    "<div class='empty'><div class='empty-glyph'>◆</div><div>No encrypted key generated in this session.</div></div>",
+                    unsafe_allow_html=True,
+                )
+
+    sec("Active Encrypted Keys")
+    key_docs = get_encrypted_key_docs(limit=100)
+    active_key_docs = [doc for doc in key_docs if _key_login_status(doc) == "Active"]
+    if active_key_docs:
+        key_labels = {}
+        for doc in active_key_docs:
+            max_uses = int(doc.get("max_uses", 0) or 0)
+            scans = f"{int(doc.get('uses', 0) or 0)}/{max_uses if max_uses else '∞'}"
+            label = f"{doc.get('for_user', 'Key User')} | {doc.get('fingerprint', '-')} | expires {_format_qr_dt(doc.get('expires_at'))} | logins {scans}"
+            key_labels[label] = doc
+        selected_key_label = st.selectbox("Select Encrypted Key To Revoke", list(key_labels.keys()))
+        if st.button("Revoke Selected Encrypted Key", use_container_width=True):
+            selected_doc = key_labels[selected_key_label]
+            _key_login_collection().update_one(
+                {"_id": selected_doc["_id"]},
+                {"$set": {
+                    "revoked_at": _qr_login_now(),
+                    "revoked_by": st.session_state.get("username", "Admin"),
+                }},
+            )
+            st.success("Encrypted key revoked.")
+            st.rerun()
+    else:
+        st.caption("No active encrypted keys right now.")
+
+    sec("Recent Encrypted Key Activity")
+    if not key_docs:
+        st.markdown("<div class='empty'><div class='empty-glyph'>◆</div><div>No encrypted key records yet.</div></div>", unsafe_allow_html=True)
+    else:
+        key_rows = []
+        for doc in key_docs:
+            max_uses = int(doc.get("max_uses", 0) or 0)
+            key_rows.append({
+                "For Whom": doc.get("for_user", "Key User"),
+                "Status": _key_login_status(doc),
+                "Fingerprint": doc.get("fingerprint", "-"),
+                "Logins": f"{int(doc.get('uses', 0) or 0)}/{max_uses if max_uses else '∞'}",
+                "Expires": _format_qr_dt(doc.get("expires_at")),
+                "Created By": doc.get("created_by", "Admin"),
+                "Created": _format_qr_dt(doc.get("created_at")),
+                "Last Used": _format_qr_dt(doc.get("last_used_at")),
+                "Note": doc.get("note", ""),
+            })
+        st.dataframe(pd.DataFrame(key_rows), use_container_width=True, hide_index=True)
 
 
 def page_dashboard():
