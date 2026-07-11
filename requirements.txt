@@ -10,9 +10,3 @@ qrcode[pil]
 pdfplumber
 pypdf
 google-genai
-setuptools<81
-cmake
-numpy
-opencv-python-headless
-dlib-bin
-face-recognition-models
