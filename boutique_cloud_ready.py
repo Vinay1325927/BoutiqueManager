@@ -13,6 +13,7 @@ import secrets
 import uuid
 import re
 import json
+import base64
 from html import escape as html_escape
 from dotenv import load_dotenv
 
@@ -87,25 +88,6 @@ st.markdown("""
     --navy-5:       #E2EAFF;
     --cream:        #0F172A;
     --cream-dim:    #334155;
-}
-
-/* ━━━ SIDEBAR THEME TOGGLE ━━━ */
-[data-testid="stSidebar"] > div:first-child > div:first-child .stButton > button {
-    background: transparent !important;
-    border: 1px solid var(--border) !important;
-    color: var(--muted) !important;
-    font-size: 0.7rem !important;
-    padding: 0.3rem 0.8rem !important;
-    letter-spacing: 0.06em !important;
-    width: auto !important;
-    float: right;
-    margin-bottom: 0.5rem;
-}
-[data-testid="stSidebar"] > div:first-child > div:first-child .stButton > button:hover {
-    border-color: var(--border-hover) !important;
-    color: var(--blue) !important;
-    transform: none !important;
-    background: var(--blue-glow) !important;
 }
 
 html, body, [class*="css"] {
@@ -197,6 +179,22 @@ h4, h5, h6 {
     color: var(--dim);
     margin-bottom: 2.4rem;
     font-weight: 500;
+}
+.settings-top-pad { height: 0.35rem; }
+.settings-meta {
+    font-size: 0.78rem;
+    color: var(--muted);
+    line-height: 1.45;
+    padding: 0.2rem 0 0.45rem;
+}
+.settings-status {
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    background: var(--surface-2);
+    padding: 0.55rem 0.7rem;
+    margin-bottom: 0.65rem;
+    font-size: 0.78rem;
+    color: var(--text-2);
 }
 .rule { height:1px; background:linear-gradient(90deg, var(--blue) 0%, rgba(37,99,235,0.15) 60%, transparent 100%); margin:2rem 0; border:none; }
 .rule-sm { height:1px; background:linear-gradient(90deg, rgba(37,99,235,0.25), transparent); margin:1.2rem 0; border:none; }
@@ -980,6 +978,60 @@ BILL_SCOPE_PENDING = "Pending Transactions"
 BILL_SCOPE_OPTIONS = [BILL_SCOPE_ALL, BILL_SCOPE_LAST, BILL_SCOPE_PENDING]
 STATE_OPTIONS   = ["Tamil Nadu","Maharashtra","Karnataka","Delhi","Gujarat","Rajasthan","West Bengal","Uttar Pradesh","Andhra Pradesh","Telangana","Other"]
 VENDOR_MANUAL_OPTION = "Add new vendor..."
+ADMIN_NAV_OPTIONS = [
+    "Dashboard",
+    "Add Sale",
+    "Review Accounts",
+    "Update Transaction",
+    "Customer List",
+    "Vendor List",
+    "Analytics",
+    "Reminders & Alerts",
+    "Generate Bill",
+    "Passbook Reader",
+    "Work Notes",
+    "AI Assistant",
+    "Technical",
+    "Security & Devices",
+    "Backup & Restore",
+    "Logout",
+]
+MEMBER_NAV_OPTIONS = [
+    "Add Sale",
+    "Review Accounts",
+    "Customer List",
+    "Vendor List",
+    "Generate Bill",
+    "Logout",
+]
+APP_SETTING_DEFAULTS = {
+    "theme": "light",
+    "default_page": "Dashboard",
+    "default_payment_method": "UPI",
+    "default_bill_scope": BILL_SCOPE_ALL,
+    "default_review_days": 90,
+    "default_inventory_category": "All",
+    "ai_provider": "auto",
+    "gemini_model": "",
+    "openai_model": "",
+}
+MANAGED_SECRET_KEYS = [
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_AI_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GENAI_API_KEY",
+    "GEMINI_KEY",
+    "GEMINI_MODEL",
+    "AI_PROVIDER",
+    "OPENAI_API_KEY",
+    "OPENAI_MODEL",
+    "MONGO_URI",
+    "USERNAME",
+    "PASSWORD",
+    "PASSWORD_HASH",
+]
+BOOTSTRAP_SECRET_KEYS = {"MONGO_URI", "USERNAME", "PASSWORD", "PASSWORD_HASH"}
 
 # =====================================================
 # MONGODB
@@ -992,6 +1044,19 @@ def safe_secret(key: str, default: str = ""):
         return default
 
 def get_gemini_key() -> str:
+    try:
+        managed = (
+            get_managed_secret("GEMINI_API_KEY")
+            or get_managed_secret("GOOGLE_API_KEY")
+            or get_managed_secret("GOOGLE_AI_API_KEY")
+            or get_managed_secret("GOOGLE_GENERATIVE_AI_API_KEY")
+            or get_managed_secret("GENAI_API_KEY")
+            or get_managed_secret("GEMINI_KEY")
+        )
+        if managed:
+            return managed
+    except Exception:
+        pass
     return (
         safe_secret("GEMINI_API_KEY", "")
         or safe_secret("GOOGLE_API_KEY", "")
@@ -1009,15 +1074,48 @@ def get_gemini_key() -> str:
     )
 
 def get_gemini_model() -> str:
+    override = str(st.session_state.get("gemini_model", "") or "").strip()
+    if override:
+        return override
+    try:
+        managed = get_managed_secret("GEMINI_MODEL")
+        if managed:
+            return managed
+    except Exception:
+        pass
     return safe_secret("GEMINI_MODEL", "") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 def get_openai_key() -> str:
+    try:
+        managed = get_managed_secret("OPENAI_API_KEY")
+        if managed:
+            return managed
+    except Exception:
+        pass
     return safe_secret("OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
 
 def get_openai_model() -> str:
+    override = str(st.session_state.get("openai_model", "") or "").strip()
+    if override:
+        return override
+    try:
+        managed = get_managed_secret("OPENAI_MODEL")
+        if managed:
+            return managed
+    except Exception:
+        pass
     return safe_secret("OPENAI_MODEL", "") or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 def get_ai_provider() -> str:
+    override = str(st.session_state.get("ai_provider", "") or "").strip().lower()
+    if override and override != "auto":
+        return override
+    try:
+        managed = get_managed_secret("AI_PROVIDER").strip().lower()
+        if managed:
+            return managed
+    except Exception:
+        pass
     configured = (safe_secret("AI_PROVIDER", "") or os.getenv("AI_PROVIDER", "")).strip().lower()
     if configured:
         return configured
@@ -1633,6 +1731,117 @@ def get_db():
 def get_col():
     return get_db()["sales"]
 
+def managed_secrets_collection():
+    return get_db()["managed_secrets"]
+
+def _secret_encryption_material() -> str:
+    return (
+        safe_secret("SECRET_ENCRYPTION_KEY", "")
+        or safe_secret("TECHNICAL_SECRET_KEY", "")
+        or os.getenv("SECRET_ENCRYPTION_KEY", "")
+        or os.getenv("TECHNICAL_SECRET_KEY", "")
+        or safe_secret("PASSWORD_HASH", "")
+        or os.getenv("PASSWORD_HASH", "")
+        or safe_secret("PASSWORD", "")
+        or os.getenv("PASSWORD", "")
+    )
+
+def _secret_cipher():
+    material = _secret_encryption_material()
+    if not material:
+        raise RuntimeError("Set PASSWORD, PASSWORD_HASH, or SECRET_ENCRYPTION_KEY before saving managed secrets.")
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as exc:
+        raise RuntimeError("Install cryptography to save encrypted managed secrets.") from exc
+    key = base64.urlsafe_b64encode(hashlib.sha256(str(material).encode("utf-8")).digest())
+    return Fernet(key)
+
+def encrypt_managed_secret(value: str) -> str:
+    return _secret_cipher().encrypt(str(value or "").encode("utf-8")).decode("utf-8")
+
+def decrypt_managed_secret(token: str) -> str:
+    if not token:
+        return ""
+    return _secret_cipher().decrypt(str(token).encode("utf-8")).decode("utf-8")
+
+def mask_secret_value(value: str, visible: int = 4) -> str:
+    value = str(value or "")
+    if not value:
+        return "Not set"
+    if len(value) <= visible * 2:
+        return "•" * len(value)
+    return f"{value[:visible]}{'•' * 8}{value[-visible:]}"
+
+def mask_mongo_uri(uri: str) -> str:
+    uri = str(uri or "")
+    if not uri:
+        return "Not set"
+    return re.sub(r"(mongodb(?:\+srv)?://)([^:@/]+):([^@/]+)@", r"\1\2:••••••••@", uri)
+
+def get_managed_secret_doc(key: str) -> dict | None:
+    key = str(key or "").strip().upper()
+    if not key:
+        return None
+    try:
+        return managed_secrets_collection().find_one({"_id": key})
+    except Exception:
+        return None
+
+def get_managed_secret(key: str) -> str:
+    doc = get_managed_secret_doc(key)
+    if not doc:
+        return ""
+    try:
+        return decrypt_managed_secret(doc.get("value_enc", ""))
+    except Exception:
+        return ""
+
+def save_managed_secret(key: str, value: str):
+    key = str(key or "").strip().upper()
+    value = str(value or "")
+    if key not in MANAGED_SECRET_KEYS:
+        raise ValueError("Unsupported secret key.")
+    if not value:
+        raise ValueError("Secret value cannot be empty.")
+    doc = {
+        "_id": key,
+        "value_enc": encrypt_managed_secret(value),
+        "fingerprint": hashlib.sha256(value.encode("utf-8")).hexdigest()[:16],
+        "masked": mask_mongo_uri(value) if key == "MONGO_URI" else mask_secret_value(value),
+        "updated_at": datetime.now(),
+        "updated_by": st.session_state.get("username", "Admin"),
+        "active": True,
+    }
+    managed_secrets_collection().update_one({"_id": key}, {"$set": doc}, upsert=True)
+
+def delete_managed_secret(key: str):
+    key = str(key or "").strip().upper()
+    if key:
+        managed_secrets_collection().delete_one({"_id": key})
+
+def secret_presence(key: str) -> dict:
+    key = str(key or "").strip().upper()
+    managed_doc = get_managed_secret_doc(key)
+    env_value = os.getenv(key, "")
+    streamlit_value = safe_secret(key, "")
+    source = []
+    if managed_doc:
+        source.append("Managed")
+    if streamlit_value:
+        source.append("Streamlit")
+    if env_value:
+        source.append("Environment")
+    raw_value = get_managed_secret(key) if managed_doc else (streamlit_value or env_value)
+    return {
+        "key": key,
+        "source": " + ".join(source) if source else "Not set",
+        "managed": bool(managed_doc),
+        "masked": mask_mongo_uri(raw_value) if key == "MONGO_URI" else mask_secret_value(raw_value),
+        "updated_at": managed_doc.get("updated_at") if managed_doc else "",
+        "updated_by": managed_doc.get("updated_by", "") if managed_doc else "",
+    }
+
 def get_next_id():
     counter = get_db()["counters"].find_one_and_update(
         {"_id": "sales_id"},
@@ -1755,16 +1964,250 @@ def get_existing_vendors():
                 if vendor:
                     vendors.add(vendor)
         except Exception:
-            pass
+                pass
     return sorted(vendors, key=str.casefold)
+
+def app_settings_collection():
+    return get_db()["app_settings"]
+
+def normalize_app_settings(raw: dict | None = None) -> dict:
+    settings = APP_SETTING_DEFAULTS.copy()
+    settings.update(raw or {})
+
+    settings["theme"] = str(settings.get("theme", "light")).strip().lower()
+    if settings["theme"] not in {"light", "dark"}:
+        settings["theme"] = APP_SETTING_DEFAULTS["theme"]
+
+    allowed_pages = [p for p in dict.fromkeys(ADMIN_NAV_OPTIONS + MEMBER_NAV_OPTIONS) if p != "Logout"]
+    if settings.get("default_page") not in allowed_pages:
+        settings["default_page"] = APP_SETTING_DEFAULTS["default_page"]
+
+    if settings.get("default_payment_method") not in PAYMENT_METHODS:
+        settings["default_payment_method"] = APP_SETTING_DEFAULTS["default_payment_method"]
+
+    if settings.get("default_bill_scope") not in BILL_SCOPE_OPTIONS:
+        settings["default_bill_scope"] = APP_SETTING_DEFAULTS["default_bill_scope"]
+
+    try:
+        settings["default_review_days"] = max(7, min(int(settings.get("default_review_days", 90)), 365))
+    except Exception:
+        settings["default_review_days"] = APP_SETTING_DEFAULTS["default_review_days"]
+
+    inventory_options = ["All"] + CATEGORIES
+    if settings.get("default_inventory_category") not in inventory_options:
+        settings["default_inventory_category"] = APP_SETTING_DEFAULTS["default_inventory_category"]
+
+    settings["ai_provider"] = str(settings.get("ai_provider", "auto")).strip().lower()
+    if settings["ai_provider"] not in {"auto", "gemini", "google", "openai"}:
+        settings["ai_provider"] = APP_SETTING_DEFAULTS["ai_provider"]
+    if settings["ai_provider"] == "google":
+        settings["ai_provider"] = "gemini"
+
+    settings["gemini_model"] = str(settings.get("gemini_model", "") or "").strip()[:120]
+    settings["openai_model"] = str(settings.get("openai_model", "") or "").strip()[:120]
+    return settings
+
+@st.cache_data(ttl=60)
+def load_app_settings() -> dict:
+    try:
+        doc = app_settings_collection().find_one({"_id": "global"}, {"_id": 0}) or {}
+    except Exception:
+        doc = {}
+    return normalize_app_settings(doc)
+
+def save_app_settings(updates: dict):
+    current = load_app_settings()
+    current.update(updates or {})
+    clean = normalize_app_settings(current)
+    clean.update({
+        "updated_at": str(datetime.now()),
+        "updated_by": st.session_state.get("username", "Admin"),
+    })
+    app_settings_collection().update_one({"_id": "global"}, {"$set": clean}, upsert=True)
+    load_app_settings.clear()
+    for key in APP_SETTING_DEFAULTS:
+        st.session_state[key] = clean[key]
+
+def apply_persistent_app_settings():
+    if st.session_state.get("app_settings_loaded"):
+        return
+    settings = load_app_settings()
+    for key, value in settings.items():
+        st.session_state[key] = value
+    st.session_state.app_settings_loaded = True
+
+def app_pref(key: str, default=None):
+    if key in st.session_state:
+        return st.session_state[key]
+    return load_app_settings().get(key, APP_SETTING_DEFAULTS.get(key, default))
+
+def nav_options_for_current_user(include_logout: bool = True) -> list[str]:
+    options = ADMIN_NAV_OPTIONS if _is_admin() else MEMBER_NAV_OPTIONS
+    if include_logout:
+        return list(options)
+    return [page for page in options if page != "Logout"]
+
+def render_top_settings():
+    notice = st.session_state.pop("settings_notice", None)
+    if notice:
+        st.toast(notice)
+
+    nav_choices = nav_options_for_current_user(include_logout=False)
+    default_page = app_pref("default_page", nav_choices[0])
+    if default_page not in nav_choices:
+        default_page = nav_choices[0]
+
+    payment_default = app_pref("default_payment_method", "UPI")
+    if payment_default not in PAYMENT_METHODS:
+        payment_default = "UPI" if "UPI" in PAYMENT_METHODS else PAYMENT_METHODS[0]
+
+    bill_default = app_pref("default_bill_scope", BILL_SCOPE_ALL)
+    if bill_default not in BILL_SCOPE_OPTIONS:
+        bill_default = BILL_SCOPE_ALL
+
+    inventory_options = ["All"] + CATEGORIES
+    inventory_default = app_pref("default_inventory_category", "All")
+    if inventory_default not in inventory_options:
+        inventory_default = "All"
+
+    provider_options = ["auto", "gemini", "openai"]
+    provider_labels = {
+        "auto": "Auto",
+        "gemini": "Gemini",
+        "openai": "OpenAI",
+    }
+    provider_default = app_pref("ai_provider", "auto")
+    if provider_default not in provider_options:
+        provider_default = "auto"
+
+    st.markdown("<div class='settings-top-pad'></div>", unsafe_allow_html=True)
+    with st.popover("Settings"):
+        app_tab, ai_tab, account_tab = st.tabs(["App", "AI", "Account"])
+
+        with app_tab:
+            theme_choice = st.radio(
+                "Appearance",
+                ["Light", "Dark"],
+                horizontal=True,
+                index=1 if app_pref("theme", "light") == "dark" else 0,
+                key="settings_theme_choice",
+            )
+            default_page_choice = st.selectbox(
+                "Default page after sign-in",
+                nav_choices,
+                index=nav_choices.index(default_page),
+                key="settings_default_page_choice",
+            )
+            default_payment_choice = st.selectbox(
+                "Default payment method",
+                PAYMENT_METHODS,
+                index=PAYMENT_METHODS.index(payment_default),
+                key="settings_default_payment_choice",
+            )
+            default_bill_choice = st.selectbox(
+                "Default bill type",
+                BILL_SCOPE_OPTIONS,
+                index=BILL_SCOPE_OPTIONS.index(bill_default),
+                key="settings_default_bill_choice",
+            )
+            review_days_choice = st.number_input(
+                "Review date range",
+                min_value=7,
+                max_value=365,
+                value=int(app_pref("default_review_days", 90)),
+                step=7,
+                key="settings_review_days_choice",
+            )
+            inventory_category_choice = st.selectbox(
+                "Default inventory category",
+                inventory_options,
+                index=inventory_options.index(inventory_default),
+                key="settings_inventory_category_choice",
+            )
+            if st.button("Save App Settings", key="settings_save_app", width="stretch"):
+                save_app_settings({
+                    "theme": theme_choice.lower(),
+                    "default_page": default_page_choice,
+                    "default_payment_method": default_payment_choice,
+                    "default_bill_scope": default_bill_choice,
+                    "default_review_days": int(review_days_choice),
+                    "default_inventory_category": inventory_category_choice,
+                })
+                st.session_state.settings_force_page = default_page_choice
+                st.session_state.settings_notice = "Settings saved."
+                st.rerun()
+
+        with ai_tab:
+            ai_status = "Configured" if llm_is_configured() else "Not configured"
+            gemini_status = "Gemini key found" if get_gemini_key() else "Gemini key missing"
+            st.markdown(
+                f"<div class='settings-status'><b>AI status:</b> {html_escape(ai_status)}<br>{html_escape(gemini_status)}</div>",
+                unsafe_allow_html=True,
+            )
+            provider_choice = st.selectbox(
+                "AI provider",
+                provider_options,
+                format_func=lambda value: provider_labels.get(value, value.title()),
+                index=provider_options.index(provider_default),
+                key="settings_ai_provider_choice",
+            )
+            gemini_model_choice = st.text_input(
+                "Gemini model override",
+                value=str(app_pref("gemini_model", "") or ""),
+                placeholder=safe_secret("GEMINI_MODEL", "") or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+                key="settings_gemini_model_choice",
+            )
+            openai_model_choice = st.text_input(
+                "OpenAI model override",
+                value=str(app_pref("openai_model", "") or ""),
+                placeholder=safe_secret("OPENAI_MODEL", "") or os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                key="settings_openai_model_choice",
+            )
+            if st.button("Save AI Settings", key="settings_save_ai", width="stretch"):
+                save_app_settings({
+                    "ai_provider": provider_choice,
+                    "gemini_model": gemini_model_choice,
+                    "openai_model": openai_model_choice,
+                })
+                st.session_state.settings_notice = "AI settings saved."
+                st.rerun()
+
+        with account_tab:
+            username = st.session_state.get("username", "Admin")
+            role = st.session_state.get("user_role", "admin").title()
+            method = st.session_state.get("auth_method", "password").replace("_", " ").title()
+            st.markdown(
+                f"<div class='settings-status'><b>{html_escape(username)}</b><br>Role: {html_escape(role)}<br>Login: {html_escape(method)}</div>",
+                unsafe_allow_html=True,
+            )
+            if _is_admin():
+                if st.button("Open Security & Devices", key="settings_open_security", width="stretch"):
+                    st.session_state.settings_force_page = "Security & Devices"
+                    st.rerun()
+            if st.button("Refresh Data Cache", key="settings_refresh_cache", width="stretch"):
+                invalidate_cache()
+                load_app_settings.clear()
+                st.session_state.settings_notice = "Data cache refreshed."
+                st.rerun()
+            if st.button("Sign Out", key="settings_sign_out", width="stretch"):
+                logout_current_session()
+                st.rerun()
 
 # =====================================================
 # HELPERS
 # =====================================================
 
 def page_header(title, sub):
-    st.markdown(f"<div class='page-title'>{html_escape(title)}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='page-sub'>{html_escape(sub)}</div>", unsafe_allow_html=True)
+    if st.session_state.get("logged_in", False):
+        left, right = st.columns([0.78, 0.22])
+        with left:
+            st.markdown(f"<div class='page-title'>{html_escape(title)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='page-sub'>{html_escape(sub)}</div>", unsafe_allow_html=True)
+        with right:
+            render_top_settings()
+    else:
+        st.markdown(f"<div class='page-title'>{html_escape(title)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='page-sub'>{html_escape(sub)}</div>", unsafe_allow_html=True)
 
 def sec(label):
     st.markdown(f"<div class='sec-head'>{html_escape(label)}</div>", unsafe_allow_html=True)
@@ -2985,10 +3428,13 @@ def page_add_sale(public=False):
         with pr2: _, sell, sell_ok         = currency_input("Selling Price (₹) *", "sale_selling_price")
         with pr3: _, paid_amt, paid_ok     = currency_input("Amount Paid (₹)", "sale_amount_paid")
         with pr4:
+            default_payment = "UPI" if public else app_pref("default_payment_method", "UPI")
+            if default_payment not in PAYMENT_METHODS:
+                default_payment = "UPI" if "UPI" in PAYMENT_METHODS else PAYMENT_METHODS[0]
             pm = st.selectbox(
                 "Payment Method",
                 PAYMENT_METHODS,
-                index=PAYMENT_METHODS.index("UPI") if "UPI" in PAYMENT_METHODS else 0,
+                index=PAYMENT_METHODS.index(default_payment),
                 key="sale_payment_method",
             )
 
@@ -3099,6 +3545,9 @@ def auth_devices_collection():
 def auth_keys_collection():
     return get_db()["auth_encrypted_key_logins"]
 
+def technical_settings_collection():
+    return get_db()["technical_settings"]
+
 @st.cache_resource
 def ensure_auth_indexes():
     try:
@@ -3107,6 +3556,8 @@ def ensure_auth_indexes():
         auth_devices_collection().create_index([("active", 1), ("last_login_at", -1)])
         auth_keys_collection().create_index([("active", 1), ("expires_at", 1)])
         auth_keys_collection().create_index("public_key_hash", unique=True)
+        technical_settings_collection().create_index("updated_at")
+        managed_secrets_collection().create_index("updated_at")
     except Exception:
         pass
 
@@ -3614,6 +4065,10 @@ def _clear_auth_state():
         "pending_qr_pin_ok",
         "generated_temp_qr",
         "auth_device_id",
+        "technical_unlocked",
+        "technical_unlocked_at",
+        "technical_auth_method",
+        "generated_technical_password",
     ):
         st.session_state.pop(key, None)
     st.session_state.logged_in = False
@@ -3692,6 +4147,57 @@ def _verify_credentials(username: str, password: str) -> bool:
         pass_ok = False
 
     return user_ok and pass_ok
+
+def _verify_admin_password_only(password: str) -> bool:
+    stored_hash = _get_stored_hash()
+    if stored_hash is None:
+        return False
+    try:
+        bcrypt = _bcrypt_lib()
+        return bcrypt.checkpw(str(password or "").encode(), stored_hash)
+    except Exception:
+        return False
+
+def get_technical_access_doc() -> dict:
+    try:
+        return technical_settings_collection().find_one({"_id": "technical_access"}) or {}
+    except Exception:
+        return {}
+
+def technical_password_status() -> str:
+    doc = get_technical_access_doc()
+    if doc.get("password_hash") and doc.get("active", True):
+        return "Generated technical password active"
+    return "Fallback admin password only"
+
+def verify_technical_password(password: str) -> tuple[bool, str]:
+    password = str(password or "")
+    doc = get_technical_access_doc()
+    if doc.get("password_hash") and doc.get("active", True):
+        if _check_pin(password, str(doc.get("password_hash", ""))):
+            return True, "technical_password"
+    if _verify_admin_password_only(password):
+        return True, "admin_fallback"
+    return False, ""
+
+def generate_technical_password() -> str:
+    password = secrets.token_urlsafe(24)
+    technical_settings_collection().update_one(
+        {"_id": "technical_access"},
+        {"$set": {
+            "password_hash": _hash_pin(password),
+            "active": True,
+            "updated_at": datetime.now(),
+            "updated_by": st.session_state.get("username", "Admin"),
+            "last_generated_at": datetime.now(),
+        }},
+        upsert=True,
+    )
+    return password
+
+def clear_technical_unlock():
+    for key in ("technical_unlocked", "technical_unlocked_at", "technical_auth_method"):
+        st.session_state.pop(key, None)
 
 
 # =====================================================
@@ -3836,13 +4342,6 @@ def render_admin_login_strip():
 
 def sidebar():
     with st.sidebar:
-        # ── THEME TOGGLE ──────────────────────────────────────────────────
-        is_light = st.session_state.theme == "light"
-        toggle_label = "🌙 Dark Mode" if is_light else "☀️ Light Mode"
-        if st.button(toggle_label, key="theme_toggle"):
-            st.session_state.theme = "dark" if is_light else "light"
-            st.rerun()
-
         st.markdown("""
         <div class='sb-brand'>
             <div class='sb-logo' style='font-family:"DM Serif Display",serif'>Shree Krishna</div>
@@ -3862,33 +4361,17 @@ def sidebar():
 
         st.markdown("<div class='sb-sep'></div>", unsafe_allow_html=True)
 
-        if _is_admin():
-            nav_options = [
-                "Dashboard",
-                "Add Sale",
-                "Review Accounts",
-                "Update Transaction",
-                "Customer List",
-                "Analytics",
-                "Reminders & Alerts",
-                "Generate Bill",
-                "Passbook Reader",
-                "Work Notes",
-                "AI Assistant",
-                "Security & Devices",
-                "Backup & Restore",
-                "Logout",
-            ]
-        else:
-            nav_options = [
-                "Add Sale",
-                "Review Accounts",
-                "Customer List",
-                "Generate Bill",
-                "Logout",
-            ]
+        nav_options = nav_options_for_current_user()
+        forced_page = st.session_state.pop("settings_force_page", None)
+        if forced_page in nav_options:
+            st.session_state["sidebar_nav"] = forced_page
+        default_page = app_pref("default_page", nav_options[0])
+        if default_page not in nav_options:
+            default_page = nav_options[0]
+        if st.session_state.get("sidebar_nav") not in nav_options:
+            st.session_state["sidebar_nav"] = default_page
 
-        nav = st.radio("Navigation", nav_options, label_visibility="collapsed")
+        nav = st.radio("Navigation", nav_options, label_visibility="collapsed", key="sidebar_nav")
 
         st.markdown("<div class='sb-sep'></div>", unsafe_allow_html=True)
         role_label = st.session_state.get("user_role", "admin").title()
@@ -4105,6 +4588,338 @@ def page_security_devices():
         "Review login security. Flag risky active keys, stale devices, expired QR invites, and suggest what to revoke or rotate.",
     )
 
+def _format_bytes(value) -> str:
+    try:
+        size = float(value or 0)
+    except Exception:
+        return "0 B"
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024 or unit == "TB":
+            return f"{size:,.1f} {unit}" if unit != "B" else f"{size:,.0f} B"
+        size /= 1024
+    return f"{size:,.1f} TB"
+
+def _json_safe(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    return value
+
+def _run_db_command(label: str, command):
+    start = time.perf_counter()
+    try:
+        result = get_db().command(command)
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        return {"label": label, "ok": True, "elapsed_ms": elapsed_ms, "result": _json_safe(result), "error": ""}
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+        return {"label": label, "ok": False, "elapsed_ms": elapsed_ms, "result": {}, "error": str(exc)}
+
+def collect_mongo_collection_stats() -> pd.DataFrame:
+    rows = []
+    db = get_db()
+    try:
+        names = sorted(db.list_collection_names(), key=str.casefold)
+    except Exception:
+        names = []
+    for name in names:
+        col = db[name]
+        row = {
+            "Collection": name,
+            "Documents": 0,
+            "Indexes": 0,
+            "Data Size": "—",
+            "Storage Size": "—",
+            "Avg Object": "—",
+            "Capped": "—",
+            "Status": "OK",
+        }
+        try:
+            row["Documents"] = int(col.estimated_document_count())
+        except Exception as exc:
+            row["Status"] = str(exc)[:120]
+        try:
+            row["Indexes"] = len(col.index_information())
+        except Exception:
+            pass
+        try:
+            stats = db.command("collstats", name)
+            row["Data Size"] = _format_bytes(stats.get("size"))
+            row["Storage Size"] = _format_bytes(stats.get("storageSize"))
+            row["Avg Object"] = _format_bytes(stats.get("avgObjSize"))
+            row["Capped"] = "Yes" if stats.get("capped") else "No"
+        except Exception:
+            pass
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+def render_technical_gate() -> bool:
+    if not _is_admin():
+        page_header("Technical", "Protected System Console")
+        st.error("Technical access is admin-only.")
+        return False
+    if st.session_state.get("technical_unlocked"):
+        return True
+
+    page_header("Technical", "Protected System Console")
+    lock_until = st.session_state.get("technical_lock_until", 0)
+    if lock_until and time.time() < lock_until:
+        left = int(lock_until - time.time())
+        st.error(f"Technical access locked for {left // 60}m {left % 60}s.")
+        return False
+    if lock_until and time.time() >= lock_until:
+        st.session_state.technical_attempts = 0
+        st.session_state.technical_lock_until = 0
+
+    with st.container(border=True):
+        st.subheader("Enter Technical Password")
+        st.caption(f"Status: {technical_password_status()}. The admin password remains the fallback password.")
+        with st.form("technical_access_form"):
+            password = st.text_input("Technical Password", type="password", key="technical_password_input")
+            submitted = st.form_submit_button("Unlock Technical", width="stretch")
+        if submitted:
+            ok, method = verify_technical_password(password)
+            if ok:
+                st.session_state.technical_unlocked = True
+                st.session_state.technical_unlocked_at = datetime.now()
+                st.session_state.technical_auth_method = method
+                st.session_state.technical_attempts = 0
+                st.session_state.technical_lock_until = 0
+                st.rerun()
+            else:
+                attempts = int(st.session_state.get("technical_attempts", 0)) + 1
+                st.session_state.technical_attempts = attempts
+                if attempts >= _MAX_ATTEMPTS:
+                    st.session_state.technical_lock_until = time.time() + _LOCKOUT_SECS
+                    st.error("Too many wrong attempts. Technical access is temporarily locked.")
+                else:
+                    time.sleep(min(_BACKOFF_BASE * (2 ** (attempts - 1)), 30))
+                    st.error(f"Invalid technical password. {max(_MAX_ATTEMPTS - attempts, 0)} attempt(s) remaining.")
+    return False
+
+def render_mongodb_monitoring_tab():
+    uri = safe_secret("MONGO_URI", os.getenv("MONGO_URI", ""))
+    commands = [
+        _run_db_command("Ping", {"ping": 1}),
+        _run_db_command("Database Stats", {"dbStats": 1}),
+        _run_db_command("Build Info", {"buildInfo": 1}),
+        _run_db_command("Connection Status", {"connectionStatus": 1}),
+        _run_db_command("Server Status", {"serverStatus": 1}),
+        _run_db_command("Host Info", {"hostInfo": 1}),
+    ]
+    command_map = {item["label"]: item for item in commands}
+    collection_stats = collect_mongo_collection_stats()
+    db_stats = command_map.get("Database Stats", {}).get("result", {})
+    server_status = command_map.get("Server Status", {}).get("result", {})
+
+    total_docs = int(collection_stats["Documents"].sum()) if not collection_stats.empty and "Documents" in collection_stats.columns else 0
+    total_indexes = int(collection_stats["Indexes"].sum()) if not collection_stats.empty and "Indexes" in collection_stats.columns else 0
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Ping", f"{command_map['Ping']['elapsed_ms']} ms" if command_map["Ping"]["ok"] else "Failed")
+    c2.metric("Collections", int(db_stats.get("collections", len(collection_stats) if not collection_stats.empty else 0) or 0))
+    c3.metric("Documents", f"{total_docs:,}")
+    c4.metric("Indexes", f"{total_indexes:,}")
+    c5.metric("Data Size", _format_bytes(db_stats.get("dataSize")))
+    c6.metric("Storage", _format_bytes(db_stats.get("storageSize")))
+
+    st.markdown("<div class='settings-status'>"
+                f"<b>Database:</b> {html_escape(get_db().name)}<br>"
+                f"<b>Mongo URI:</b> {html_escape(mask_mongo_uri(uri))}<br>"
+                f"<b>Server uptime:</b> {html_escape(str(server_status.get('uptime', 'Unavailable')))} seconds"
+                "</div>", unsafe_allow_html=True)
+
+    sec("Collections")
+    if collection_stats.empty:
+        st.info("No collections found or collection listing is not permitted.")
+    else:
+        st.dataframe(collection_stats, width="stretch", hide_index=True)
+        selected_collection = st.selectbox(
+            "Collection Details",
+            collection_stats["Collection"].tolist(),
+            key="technical_collection_detail",
+        )
+        detail = {"collection": selected_collection}
+        try:
+            detail["indexes"] = _json_safe(get_db()[selected_collection].index_information())
+        except Exception as exc:
+            detail["index_error"] = str(exc)
+        try:
+            detail["stats"] = _json_safe(get_db().command("collstats", selected_collection))
+        except Exception as exc:
+            detail["stats_error"] = str(exc)
+        try:
+            sample = get_db()[selected_collection].find_one({}, {"_id": 0}) or {}
+            detail["sample_fields"] = sorted([str(key) for key in sample.keys()])
+        except Exception as exc:
+            detail["sample_error"] = str(exc)
+        with st.expander("Selected collection technical details", expanded=False):
+            st.json(detail)
+
+    sec("Command Results")
+    command_rows = pd.DataFrame([
+        {
+            "Command": item["label"],
+            "Status": "OK" if item["ok"] else "Failed / Not permitted",
+            "Time ms": item["elapsed_ms"],
+            "Error": item["error"][:220],
+        }
+        for item in commands
+    ])
+    st.dataframe(command_rows, width="stretch", hide_index=True)
+    for item in commands:
+        with st.expander(f"{item['label']} raw result", expanded=False):
+            if item["ok"]:
+                st.json(item["result"])
+            else:
+                st.error(item["error"])
+
+def render_gemini_api_details_tab():
+    gemini_key = get_gemini_key()
+    provider = get_ai_provider()
+    model = get_gemini_model()
+    rows = [
+        secret_presence("GEMINI_API_KEY"),
+        secret_presence("GOOGLE_API_KEY"),
+        secret_presence("GEMINI_MODEL"),
+        secret_presence("AI_PROVIDER"),
+        secret_presence("OPENAI_API_KEY"),
+        secret_presence("OPENAI_MODEL"),
+    ]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("AI Provider", provider.title() if provider else "Auto")
+    c2.metric("Gemini Key", "Found" if gemini_key else "Missing")
+    c3.metric("Gemini Model", model)
+    c4.metric("AI Ready", "Yes" if llm_is_configured() else "No")
+
+    try:
+        import importlib.metadata as importlib_metadata
+        genai_version = importlib_metadata.version("google-genai")
+    except Exception:
+        genai_version = "Not installed"
+    st.markdown(
+        "<div class='settings-status'>"
+        f"<b>google-genai:</b> {html_escape(genai_version)}<br>"
+        f"<b>Active Gemini key:</b> {html_escape(mask_secret_value(gemini_key))}<br>"
+        f"<b>OpenAI key:</b> {html_escape(mask_secret_value(get_openai_key()))}"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    if st.button("Test Gemini API", key="technical_test_gemini", width="stretch"):
+        if not gemini_key:
+            st.error("Gemini API key is missing.")
+        else:
+            try:
+                from google import genai
+                from google.genai import types
+                with st.spinner("Testing Gemini..."):
+                    client = genai.Client(api_key=gemini_key)
+                    response = client.models.generate_content(
+                        model=model,
+                        contents="Reply with exactly: Gemini OK",
+                        config=types.GenerateContentConfig(temperature=0),
+                    )
+                st.success("Gemini API responded.")
+                st.code((getattr(response, "text", "") or str(response))[:1200])
+            except Exception as exc:
+                st.error(str(exc))
+
+def render_managed_secrets_tab():
+    st.warning("Managed AI secrets are encrypted in MongoDB. Streamlit Cloud deployment secrets still control startup-only values such as MONGO_URI and password unless you update them in Streamlit secrets too.")
+    rows = [secret_presence(key) for key in MANAGED_SECRET_KEYS]
+    show = pd.DataFrame(rows).rename(columns={
+        "key": "Secret",
+        "source": "Source",
+        "managed": "Managed Override",
+        "masked": "Masked Value",
+        "updated_at": "Managed Updated",
+        "updated_by": "Managed By",
+    })
+    st.dataframe(show, width="stretch", hide_index=True)
+
+    sec("Edit Secret")
+    selected_key = st.selectbox("Secret Key", MANAGED_SECRET_KEYS, key="technical_secret_key")
+    current = secret_presence(selected_key)
+    st.caption(f"Current source: {current['source']} · Value: {current['masked']}")
+    if selected_key in BOOTSTRAP_SECRET_KEYS:
+        st.info("This is a startup/login secret. You can store a managed copy here, but the live app still needs the matching Streamlit Cloud secret for startup/auth behavior.")
+
+    new_value = st.text_input("New Secret Value", type="password", key="technical_secret_value")
+    save_col, delete_col = st.columns(2)
+    with save_col:
+        if st.button("Save Encrypted Secret", key="technical_save_secret", width="stretch"):
+            try:
+                save_managed_secret(selected_key, new_value)
+                st.success(f"{selected_key} saved as an encrypted managed secret.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with delete_col:
+        if st.button("Delete Managed Override", key="technical_delete_secret", width="stretch"):
+            delete_managed_secret(selected_key)
+            st.success(f"Managed override removed for {selected_key}.")
+            st.rerun()
+
+def render_technical_settings_tab():
+    doc = get_technical_access_doc()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Technical Password", "Active" if doc.get("password_hash") and doc.get("active", True) else "Fallback Only")
+    c2.metric("Unlocked By", str(st.session_state.get("technical_auth_method", "—")).replace("_", " ").title())
+    c3.metric("Generated", _format_auth_dt(doc.get("last_generated_at")) if doc else "—")
+
+    if st.button("Generate New Technical Password", key="generate_technical_password", width="stretch"):
+        st.session_state.generated_technical_password = generate_technical_password()
+        st.success("Technical password generated. Copy it now; it will be shown only in this session.")
+
+    generated = st.session_state.get("generated_technical_password")
+    if generated:
+        st.warning("Copy this password now. It is not shown again after sign-out.")
+        st.code(generated)
+
+    a, b = st.columns(2)
+    with a:
+        if st.button("Disable Generated Password", key="disable_technical_password", width="stretch"):
+            technical_settings_collection().update_one(
+                {"_id": "technical_access"},
+                {"$set": {"active": False, "updated_at": datetime.now(), "updated_by": st.session_state.get("username", "Admin")}},
+                upsert=True,
+            )
+            st.session_state.pop("generated_technical_password", None)
+            st.success("Generated technical password disabled. Admin password fallback remains active.")
+            st.rerun()
+    with b:
+        if st.button("Lock Technical Now", key="lock_technical_now", width="stretch"):
+            clear_technical_unlock()
+            st.rerun()
+
+def page_technical():
+    if not render_technical_gate():
+        return
+
+    page_header("Technical", "System Monitoring & Secrets")
+    mongo_tab, gemini_tab, secrets_tab, settings_tab = st.tabs([
+        "MongoDB Monitoring",
+        "Gemini API Details",
+        "Secrets",
+        "Settings",
+    ])
+    with mongo_tab:
+        render_mongodb_monitoring_tab()
+    with gemini_tab:
+        render_gemini_api_details_tab()
+    with secrets_tab:
+        render_managed_secrets_tab()
+    with settings_tab:
+        render_technical_settings_tab()
+
 def page_dashboard():
     page_header("Dashboard", "Business Overview")
     df = fetch_all()
@@ -4199,7 +5014,8 @@ def page_review():
         with c4: dlayf = st.selectbox("Delay Flag", ["All","On Time","Delayed"])
         c5, c6, c7 = st.columns(3)
         with c5: sortby = st.selectbox("Sort By", ["Date ↓","Date ↑","Amount ↓","Pending ↓","Profit ↓"])
-        with c6: d_from = st.date_input("From", value=date.today() - timedelta(days=90))
+        default_review_days = int(app_pref("default_review_days", 90))
+        with c6: d_from = st.date_input("From", value=date.today() - timedelta(days=default_review_days))
         with c7: d_to   = st.date_input("To",   value=date.today())
 
     fdf = df.copy()
@@ -4574,6 +5390,226 @@ def page_customers():
         )
 
 
+def page_vendors():
+    page_header("Vendors", "Supplier Directory")
+    df = fetch_all()
+    vendors = get_existing_vendors()
+
+    try:
+        inv_docs = list(get_db()["inventory"].find({}, {"_id": 0}))
+    except Exception as exc:
+        inv_docs = []
+        st.warning(f"Inventory vendors could not be loaded: {exc}")
+
+    inv_df = pd.DataFrame(inv_docs)
+    sales_rows = pd.DataFrame(columns=["vendor"])
+    inv_items = pd.DataFrame(columns=["vendor"])
+
+    sales_summary = pd.DataFrame(columns=["vendor", "sales", "revenue", "profit", "pending", "last_sale"])
+    if df is not None and not df.empty and "vendor" in df.columns:
+        sales_rows = df.copy()
+        sales_rows["vendor"] = sales_rows["vendor"].fillna("").astype(str).str.strip()
+        sales_rows = sales_rows[sales_rows["vendor"] != ""].copy()
+        if not sales_rows.empty:
+            for col in ["selling_price", "profit", "pending_amount"]:
+                if col not in sales_rows.columns:
+                    sales_rows[col] = 0.0
+                sales_rows[col] = pd.to_numeric(sales_rows[col], errors="coerce").fillna(0.0)
+            sales_rows["_sale_date_sort"] = pd.to_datetime(sales_rows["sale_date"], errors="coerce") if "sale_date" in sales_rows.columns else pd.NaT
+            sales_summary = (
+                sales_rows.groupby("vendor").agg(
+                    sales=("vendor", "count"),
+                    revenue=("selling_price", "sum"),
+                    profit=("profit", "sum"),
+                    pending=("pending_amount", "sum"),
+                    last_sale=("_sale_date_sort", "max"),
+                ).reset_index()
+            )
+
+    inventory_summary = pd.DataFrame(columns=["vendor", "inventory_items", "stock_qty", "stock_value", "low_stock_items"])
+    if not inv_df.empty and "vendor" in inv_df.columns:
+        inv_items = inv_df.copy()
+        inv_items["vendor"] = inv_items["vendor"].fillna("").astype(str).str.strip()
+        inv_items = inv_items[inv_items["vendor"] != ""].copy()
+        if not inv_items.empty:
+            for col in ["quantity", "min_stock", "cost_price"]:
+                if col not in inv_items.columns:
+                    inv_items[col] = 0.0
+                inv_items[col] = pd.to_numeric(inv_items[col], errors="coerce").fillna(0.0)
+            inv_items["stock_value"] = inv_items["quantity"] * inv_items["cost_price"]
+            inv_items["low_stock_item"] = inv_items["quantity"] <= inv_items["min_stock"]
+            item_col = "name" if "name" in inv_items.columns else "vendor"
+            inventory_summary = (
+                inv_items.groupby("vendor").agg(
+                    inventory_items=(item_col, "count"),
+                    stock_qty=("quantity", "sum"),
+                    stock_value=("stock_value", "sum"),
+                    low_stock_items=("low_stock_item", "sum"),
+                ).reset_index()
+            )
+
+    all_vendors = sorted(set(vendors) | set(sales_summary["vendor"].astype(str)) | set(inventory_summary["vendor"].astype(str)), key=str.casefold)
+    if not all_vendors:
+        st.markdown("<div class='empty'><div class='empty-glyph'>◆</div><div>No vendors yet.</div></div>", unsafe_allow_html=True)
+        return
+
+    summary = pd.DataFrame({"vendor": all_vendors})
+    summary = summary.merge(sales_summary, on="vendor", how="left").merge(inventory_summary, on="vendor", how="left")
+    for col in ["sales", "revenue", "profit", "pending", "inventory_items", "stock_qty", "stock_value", "low_stock_items"]:
+        summary[col] = pd.to_numeric(summary[col], errors="coerce").fillna(0.0)
+    summary["last_sale_label"] = pd.to_datetime(summary["last_sale"], errors="coerce").dt.strftime("%d %b %Y").fillna("—")
+    summary["vendor_type"] = summary.apply(
+        lambda r: "Sales + Inventory" if r["sales"] > 0 and r["inventory_items"] > 0 else ("Sales" if r["sales"] > 0 else ("Inventory" if r["inventory_items"] > 0 else "Saved")),
+        axis=1,
+    )
+    summary = summary.sort_values(["revenue", "stock_value", "vendor"], ascending=[False, False, True]).reset_index(drop=True)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Vendors", len(summary))
+    m2.metric("With Sales", int((summary["sales"] > 0).sum()))
+    m3.metric("Total Revenue", f"₹{summary['revenue'].sum():,.0f}")
+    m4.metric("Stock Value", f"₹{summary['stock_value'].sum():,.0f}")
+
+    rule_sm()
+    f1, f2, f3 = st.columns([2, 1, 1])
+    with f1:
+        search = st.text_input("Search Vendor", key="vendor_list_search")
+    with f2:
+        show_filter = st.selectbox("Show", ["All Vendors", "With Sales", "With Pending", "Inventory Vendors", "Low Stock"], key="vendor_list_filter")
+    with f3:
+        sort_by = st.selectbox("Sort By", ["Revenue", "Pending", "Sales", "Inventory Items", "Vendor Name"], key="vendor_list_sort")
+
+    view = summary.copy()
+    if search:
+        view = view[view["vendor"].str.contains(search, case=False, na=False, regex=False)]
+    if show_filter == "With Sales":
+        view = view[view["sales"] > 0]
+    elif show_filter == "With Pending":
+        view = view[view["pending"] > 0]
+    elif show_filter == "Inventory Vendors":
+        view = view[view["inventory_items"] > 0]
+    elif show_filter == "Low Stock":
+        view = view[view["low_stock_items"] > 0]
+
+    sort_map = {
+        "Revenue": ("revenue", False),
+        "Pending": ("pending", False),
+        "Sales": ("sales", False),
+        "Inventory Items": ("inventory_items", False),
+        "Vendor Name": ("vendor", True),
+    }
+    sort_col, ascending = sort_map[sort_by]
+    view = view.sort_values(sort_col, ascending=ascending)
+
+    disp = view[["vendor", "vendor_type", "sales", "revenue", "profit", "pending", "last_sale_label", "inventory_items", "stock_qty", "low_stock_items"]].copy()
+    disp = disp.rename(columns={
+        "vendor": "Vendor",
+        "vendor_type": "Source",
+        "sales": "Sales",
+        "revenue": "Revenue ₹",
+        "profit": "Profit ₹",
+        "pending": "Pending ₹",
+        "last_sale_label": "Last Sale",
+        "inventory_items": "Inventory Items",
+        "stock_qty": "Stock Qty",
+        "low_stock_items": "Low Stock",
+    })
+    st.dataframe(
+        disp.style.format({
+            "Sales": "{:,.0f}",
+            "Revenue ₹": "₹{:,.0f}",
+            "Profit ₹": "₹{:,.0f}",
+            "Pending ₹": "₹{:,.0f}",
+            "Inventory Items": "{:,.0f}",
+            "Stock Qty": "{:,.0f}",
+            "Low Stock": "{:,.0f}",
+        }),
+        width="stretch",
+        hide_index=True,
+    )
+
+    dc, de = st.columns(2)
+    with dc:
+        st.download_button("Export CSV", data=disp.to_csv(index=False), file_name=f"vendors_{date.today()}.csv", mime="text/csv", width="stretch")
+    with de:
+        out = BytesIO()
+        with pd.ExcelWriter(out, engine="openpyxl") as w:
+            disp.to_excel(w, index=False)
+        out.seek(0)
+        st.download_button("Export Excel", data=out, file_name=f"vendors_{date.today()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+
+    sec("Vendor Details")
+    detail_options = view["vendor"].tolist() if not view.empty else summary["vendor"].tolist()
+
+    def vendor_label(name: str) -> str:
+        row = summary[summary["vendor"].eq(name)].iloc[0]
+        return f"{name} — {int(row['sales'])} sales / ₹{row['revenue']:,.0f}"
+
+    chosen = st.selectbox("Select Vendor", detail_options, format_func=vendor_label, key="vendor_detail_select")
+    vendor_sales = sales_rows[sales_rows["vendor"].eq(chosen)].copy() if not sales_rows.empty else pd.DataFrame()
+    vendor_inventory = inv_items[inv_items["vendor"].eq(chosen)].copy() if not inv_items.empty else pd.DataFrame()
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Sales", len(vendor_sales))
+    d2.metric("Revenue", f"₹{vendor_sales['selling_price'].sum():,.0f}" if "selling_price" in vendor_sales.columns else "₹0")
+    d3.metric("Pending", f"₹{vendor_sales['pending_amount'].sum():,.0f}" if "pending_amount" in vendor_sales.columns else "₹0")
+    d4.metric("Stock Items", len(vendor_inventory))
+
+    sales_tab, inventory_tab = st.tabs(["Sales", "Inventory"])
+    with sales_tab:
+        if vendor_sales.empty:
+            st.info("No sales found for this vendor.")
+        else:
+            vendor_sales = vendor_sales.sort_values("_sale_date_sort", ascending=False)
+            show_cols = [c for c in ["sale_date", "customer_name", "product_category", "product_description", "selling_price", "profit", "pending_amount", "payment_method"] if c in vendor_sales.columns]
+            show_sales = vendor_sales[show_cols].copy()
+            if "sale_date" in show_sales.columns:
+                show_sales["sale_date"] = pd.to_datetime(show_sales["sale_date"], errors="coerce").dt.strftime("%d %b %Y")
+            show_sales = show_sales.rename(columns={
+                "sale_date": "Date",
+                "customer_name": "Customer",
+                "product_category": "Category",
+                "product_description": "Description",
+                "selling_price": "Sell ₹",
+                "profit": "Profit ₹",
+                "pending_amount": "Pending ₹",
+                "payment_method": "Method",
+            })
+            st.dataframe(show_sales, width="stretch", hide_index=True)
+
+    with inventory_tab:
+        if vendor_inventory.empty:
+            st.info("No inventory items found for this vendor.")
+        else:
+            show_cols = [c for c in ["name", "sku", "category", "quantity", "min_stock", "cost_price", "sell_price", "notes", "updated_at"] if c in vendor_inventory.columns]
+            show_inventory = vendor_inventory[show_cols].copy()
+            show_inventory = show_inventory.rename(columns={
+                "name": "Item",
+                "sku": "SKU",
+                "category": "Category",
+                "quantity": "Qty",
+                "min_stock": "Min Stock",
+                "cost_price": "Cost ₹",
+                "sell_price": "MRP ₹",
+                "notes": "Notes",
+                "updated_at": "Updated",
+            })
+            st.dataframe(show_inventory, width="stretch", hide_index=True)
+
+    vendor_context = "\n\n".join([
+        "Vendor summary:\n" + df_for_ai(summary, ["vendor", "vendor_type", "sales", "revenue", "profit", "pending", "last_sale_label", "inventory_items", "stock_qty", "stock_value", "low_stock_items"], 120),
+        f"Selected vendor: {chosen}",
+        "Selected vendor sales:\n" + df_for_ai(vendor_sales, limit=80),
+        "Selected vendor inventory:\n" + df_for_ai(vendor_inventory, limit=80),
+    ])
+    render_ai_panel(
+        "AI Vendor Insights",
+        vendor_context,
+        "vendor_list_ai",
+        "Identify top vendors, pending risks, restock opportunities, and practical follow-up actions.",
+    )
+
+
 def page_generate_bill():
     page_header("Generate Bill", "Customer PDF Statement")
     df = fetch_all()
@@ -4593,10 +5629,13 @@ def page_generate_bill():
         return f"{name} — Pending ₹{pending:,.0f} / Total ₹{total:,.0f}"
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    bill_scope_default = app_pref("default_bill_scope", BILL_SCOPE_ALL)
+    if bill_scope_default not in BILL_SCOPE_OPTIONS:
+        bill_scope_default = BILL_SCOPE_ALL
     with c1:
         selected = st.selectbox("Customer", customers, format_func=customer_label, key="bill_customer")
     with c2:
-        bill_scope = st.selectbox("Bill Type", BILL_SCOPE_OPTIONS, key="bill_scope")
+        bill_scope = st.selectbox("Bill Type", BILL_SCOPE_OPTIONS, index=BILL_SCOPE_OPTIONS.index(bill_scope_default), key="bill_scope")
     with c3:
         bill_limit = st.number_input("Last Transactions", min_value=1, max_value=100, value=5, step=1, key="bill_limit", disabled=bill_scope != BILL_SCOPE_LAST)
     with c4:
@@ -4974,7 +6013,16 @@ def page_inventory():
             m4.metric("Out of Stock",    len(out_of_stock))
             if not low_stock.empty: st.warning(f"{len(low_stock)} item(s) running low.")
             rule_sm()
-            cat_f = st.selectbox("Filter by Category", ["All"] + CATEGORIES)
+            inventory_filter_options = ["All"] + CATEGORIES
+            inventory_default = app_pref("default_inventory_category", "All")
+            if inventory_default not in inventory_filter_options:
+                inventory_default = "All"
+            cat_f = st.selectbox(
+                "Filter by Category",
+                inventory_filter_options,
+                index=inventory_filter_options.index(inventory_default),
+                key="inventory_category_filter",
+            )
             view  = inv_df.copy()
             if cat_f != "All" and "category" in view.columns: view = view[view["category"] == cat_f]
             if "quantity" in view.columns and "min_stock" in view.columns:
@@ -5034,6 +6082,10 @@ def page_inventory():
 # =====================================================
 
 def page_backup_restore():
+    _, settings_col = st.columns([0.78, 0.22])
+    with settings_col:
+        render_top_settings()
+
     # ── Header ────────────────────────────────────────────────────────────
     st.markdown("""
     <div class='bk-header'>
@@ -5466,6 +6518,15 @@ def page_ai_assistant():
 # MAIN
 # =====================================================
 
+def logout_current_session():
+    device_id = st.session_state.get("auth_device_id")
+    if device_id:
+        auth_devices_collection().update_one(
+            {"_id": device_id},
+            {"$set": {"active": False, "logged_out_at": datetime.now()}},
+        )
+    _clear_auth_state()
+
 def main():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
@@ -5473,6 +6534,8 @@ def main():
         st.session_state.theme = "light"
     if st.session_state.logged_in and "user_role" not in st.session_state:
         st.session_state.user_role = "admin"
+    if st.session_state.logged_in:
+        apply_persistent_app_settings()
 
     # Apply light mode CSS overrides if needed
     inject_theme()
@@ -5495,22 +6558,18 @@ def main():
     elif "Review"      in page: page_review()
     elif "Update"      in page: page_update()
     elif "Customer"    in page: page_customers()
+    elif "Vendor List" in page: page_vendors()
     elif "Analytics"   in page: page_analytics()
     elif "Reminders"   in page: page_reminders()
     elif "Generate Bill" in page: page_generate_bill()
     elif "Passbook Reader" in page: page_passbook_reader()
     elif "Work Notes"  in page: page_work_notes()
     elif "AI Assistant" in page: page_ai_assistant()
+    elif "Technical"   in page: page_technical()
     elif "Security"    in page: page_security_devices()
     elif "Backup"      in page: page_backup_restore()
     elif "Logout"      in page:
-        device_id = st.session_state.get("auth_device_id")
-        if device_id:
-            auth_devices_collection().update_one(
-                {"_id": device_id},
-                {"$set": {"active": False, "logged_out_at": datetime.now()}},
-            )
-        _clear_auth_state()
+        logout_current_session()
         st.rerun()
 
 if __name__ == "__main__":
